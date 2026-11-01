@@ -1,0 +1,2757 @@
+use crate::cloudflare::{Auth, WAFList, TTL};
+use crate::domain;
+use crate::notifier::{
+    CompositeNotifier, HealthchecksMonitor, Heartbeat, HeartbeatMonitor, NotifierDyn,
+    ShoutrrrNotifier, UptimeKumaMonitor,
+};
+use crate::pp::{self, PP};
+use crate::provider::{IpType, ProviderType};
+use serde::Deserialize;
+use std::collections::HashMap;
+use std::env;
+use std::path::PathBuf;
+use std::time::Duration;
+
+// ============================================================
+// Legacy JSON Config (backwards compatible with cloudflare-ddns)
+// ============================================================
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct LegacyConfig {
+    pub cloudflare: Vec<LegacyCloudflareEntry>,
+    #[serde(default = "default_true")]
+    pub a: bool,
+    #[serde(default = "default_true")]
+    pub aaaa: bool,
+    #[serde(rename = "purgeUnknownRecords", default)]
+    pub purge_unknown_records: bool,
+    #[serde(default = "default_ttl")]
+    pub ttl: i64,
+    #[serde(default)]
+    pub ip4_provider: Option<String>,
+    #[serde(default)]
+    pub ip6_provider: Option<String>,
+    #[serde(rename = "recordComment", alias = "record_comment", default)]
+    pub record_comment: Option<String>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_ttl() -> i64 {
+    300
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct LegacyCloudflareEntry {
+    pub authentication: LegacyAuthentication,
+    pub zone_id: String,
+    pub subdomains: Vec<LegacySubdomainEntry>,
+    #[serde(default)]
+    pub proxied: bool,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(untagged)]
+pub enum LegacySubdomainEntry {
+    Detailed { name: String, proxied: bool },
+    Simple(String),
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct LegacyAuthentication {
+    #[serde(default)]
+    pub api_token: String,
+    #[serde(default)]
+    pub api_key: Option<LegacyApiKey>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct LegacyApiKey {
+    pub api_key: String,
+    pub account_email: String,
+}
+
+// ============================================================
+// Unified Config (supports both legacy JSON and env var modes)
+// ============================================================
+
+/// An additional detection group from numbered env vars (`DOMAINS_2`,
+/// `IP4_PROVIDER_2`, ...). Each group detects its own addresses, e.g. through
+/// a different network interface, and updates its own domains (issue #248).
+#[derive(Debug, Clone)]
+pub struct DetectionGroup {
+    /// The env var suffix, e.g. "2".
+    pub label: String,
+    pub providers: HashMap<IpType, ProviderType>,
+    pub domains: HashMap<IpType, Vec<String>>,
+}
+
+/// A view of one detection group: the default (unsuffixed) one or an extra one.
+pub struct GroupRef<'a> {
+    pub label: Option<&'a str>,
+    pub providers: &'a HashMap<IpType, ProviderType>,
+    pub domains: &'a HashMap<IpType, Vec<String>>,
+}
+
+impl GroupRef<'_> {
+    /// Log/message suffix identifying the group; empty for the default group.
+    pub fn tag(&self) -> String {
+        match self.label {
+            Some(l) => format!(" (group {l})"),
+            None => String::new(),
+        }
+    }
+}
+
+/// The complete application configuration
+pub struct AppConfig {
+    pub auth: Auth,
+    /// Providers and domains of the default detection group (unsuffixed vars).
+    pub providers: HashMap<IpType, ProviderType>,
+    pub domains: HashMap<IpType, Vec<String>>, // FQDN domains by IP type
+    /// Additional detection groups (`DOMAINS_2`, ...); empty for most setups.
+    pub extra_groups: Vec<DetectionGroup>,
+    pub waf_lists: Vec<WAFList>,
+    pub update_cron: CronSchedule,
+    pub update_on_start: bool,
+    pub delete_on_stop: bool,
+    pub delete_on_failure: bool,
+    pub ttl: TTL,
+    pub proxied_expression: Option<Box<dyn Fn(&str) -> bool + Send + Sync>>,
+    pub record_comment: Option<String>,
+    pub managed_comment_regex: Option<regex_lite::Regex>,
+    pub waf_list_description: Option<String>,
+    pub waf_list_item_comment: Option<String>,
+    pub managed_waf_comment_regex: Option<regex_lite::Regex>,
+    pub detection_timeout: Duration,
+    pub update_timeout: Duration,
+    pub reject_cloudflare_ips: bool,
+    pub dry_run: bool,
+    pub emoji: bool,
+    pub quiet: bool,
+    // Legacy mode fields
+    pub legacy_mode: bool,
+    pub legacy_config: Option<LegacyConfig>,
+    pub repeat: bool,
+}
+
+impl AppConfig {
+    /// All detection groups, default first.
+    pub fn groups(&self) -> Vec<GroupRef<'_>> {
+        std::iter::once(GroupRef {
+            label: None,
+            providers: &self.providers,
+            domains: &self.domains,
+        })
+        .chain(self.extra_groups.iter().map(|g| GroupRef {
+            label: Some(g.label.as_str()),
+            providers: &g.providers,
+            domains: &g.domains,
+        }))
+        .collect()
+    }
+}
+
+/// Shortest allowed `@every` interval; anything lower hammers the Cloudflare API.
+pub const MIN_UPDATE_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Legacy-mode polling interval when the record TTL is "auto" (1).
+pub const LEGACY_AUTO_TTL_INTERVAL: Duration = Duration::from_secs(300);
+
+/// Cron schedule
+#[derive(Debug, Clone)]
+pub enum CronSchedule {
+    Every(Duration),
+    Once,
+}
+
+impl CronSchedule {
+    pub fn describe(&self) -> String {
+        match self {
+            CronSchedule::Every(d) => format!("@every {}s", d.as_secs()),
+            CronSchedule::Once => "@once".to_string(),
+        }
+    }
+
+    pub fn next_duration(&self) -> Option<Duration> {
+        match self {
+            CronSchedule::Every(d) => Some(*d),
+            CronSchedule::Once => None,
+        }
+    }
+}
+
+fn parse_duration_string(s: &str) -> Option<Duration> {
+    let s = s.trim();
+    if let Some(minutes) = s.strip_suffix('m') {
+        minutes
+            .parse::<u64>()
+            .ok()
+            .and_then(|m| m.checked_mul(60))
+            .map(Duration::from_secs)
+    } else if let Some(hours) = s.strip_suffix('h') {
+        hours
+            .parse::<u64>()
+            .ok()
+            .and_then(|h| h.checked_mul(3600))
+            .map(Duration::from_secs)
+    } else if let Some(secs) = s.strip_suffix('s') {
+        secs.parse::<u64>().ok().map(Duration::from_secs)
+    } else {
+        // Try as seconds
+        s.parse::<u64>().ok().map(Duration::from_secs)
+    }
+}
+
+// ============================================================
+// Environment Variable Configuration (cf-ddns mode)
+// ============================================================
+
+fn getenv(key: &str) -> Option<String> {
+    env::var(key)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+fn getenv_bool(key: &str, default: bool) -> bool {
+    match getenv(key) {
+        Some(v) => matches!(v.to_lowercase().as_str(), "true" | "1" | "yes"),
+        None => default,
+    }
+}
+
+fn getenv_duration(key: &str, default: Duration) -> Result<Duration, String> {
+    match getenv(key) {
+        Some(v) => match parse_duration_string(&v) {
+            Some(d) if !d.is_zero() => Ok(d),
+            _ => Err(format!(
+                "Invalid {key}: '{v}'. Use a positive whole number with an optional s/m/h suffix (e.g. 5s)."
+            )),
+        },
+        None => Ok(default),
+    }
+}
+
+/// Validate an API token and strip accidental surrounding quotes.
+///
+/// Cloudflare rejects malformed tokens with the opaque error 6111 "Invalid format
+/// for Authorization header" (issue #292). Common causes are quotes copied into a
+/// compose list entry or NAS UI, and stray whitespace. The token itself is never
+/// included in messages.
+pub(crate) fn normalize_token(raw: &str, source: &str, ppfmt: &PP) -> Result<String, String> {
+    let mut token = raw.trim();
+    for q in ['"', '\'', '`'] {
+        if token.len() >= 2 && token.starts_with(q) && token.ends_with(q) {
+            ppfmt.warningf(
+                pp::EMOJI_WARNING,
+                &format!("{source} is wrapped in quotes; ignoring them. Remove the quotes from your configuration."),
+            );
+            token = token[1..token.len() - 1].trim();
+        }
+    }
+    if token.is_empty() {
+        return Err(format!("{source} is empty"));
+    }
+    if let Some((pos, _)) = token
+        .char_indices()
+        .find(|(_, c)| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')))
+    {
+        return Err(format!(
+            "{source} contains an invalid character at position {} (length {}). API tokens only contain letters, digits, '-' and '_'. Check for quotes, spaces, line breaks or an unsubstituted ${{...}} placeholder.",
+            pos + 1,
+            token.len()
+        ));
+    }
+    Ok(token.to_string())
+}
+
+fn getenv_list(key: &str, sep: char) -> Vec<String> {
+    match getenv(key) {
+        Some(v) => v
+            .split(sep)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect(),
+        None => Vec::new(),
+    }
+}
+
+fn read_auth_from_env(ppfmt: &PP) -> Option<Auth> {
+    // Try CLOUDFLARE_API_TOKEN first, then CF_API_TOKEN (deprecated)
+    if let Some(token) = getenv("CLOUDFLARE_API_TOKEN").or_else(|| {
+        let val = getenv("CF_API_TOKEN");
+        if val.is_some() {
+            ppfmt.warningf(
+                pp::EMOJI_WARNING,
+                "CF_API_TOKEN is deprecated; use CLOUDFLARE_API_TOKEN instead",
+            );
+        }
+        val
+    }) {
+        if token == "YOUR-CLOUDFLARE-API-TOKEN" {
+            ppfmt.errorf(
+                pp::EMOJI_ERROR,
+                "Please set CLOUDFLARE_API_TOKEN to your actual API token",
+            );
+            return None;
+        }
+        return match normalize_token(&token, "CLOUDFLARE_API_TOKEN", ppfmt) {
+            Ok(t) => Some(Auth::Token(t)),
+            Err(e) => {
+                ppfmt.errorf(pp::EMOJI_ERROR, &e);
+                None
+            }
+        };
+    }
+
+    // Try reading from file
+    if let Some(path) = getenv("CLOUDFLARE_API_TOKEN_FILE").or_else(|| {
+        let val = getenv("CF_API_TOKEN_FILE");
+        if val.is_some() {
+            ppfmt.warningf(
+                pp::EMOJI_WARNING,
+                "CF_API_TOKEN_FILE is deprecated; use CLOUDFLARE_API_TOKEN_FILE instead",
+            );
+        }
+        val
+    }) {
+        match std::fs::read_to_string(&path) {
+            Ok(content) => {
+                if !content.trim().is_empty() {
+                    return match normalize_token(&content, "API token file", ppfmt) {
+                        Ok(t) => Some(Auth::Token(t)),
+                        Err(e) => {
+                            ppfmt.errorf(pp::EMOJI_ERROR, &e);
+                            None
+                        }
+                    };
+                }
+            }
+            Err(e) => {
+                ppfmt.errorf(
+                    pp::EMOJI_ERROR,
+                    &format!(
+                        "Failed to read API token file '{path}': {e}{}",
+                        permission_hint(&e)
+                    ),
+                );
+            }
+        }
+    }
+
+    // Deprecated: CF_ACCOUNT_ID
+    if getenv("CF_ACCOUNT_ID").is_some() {
+        ppfmt.warningf(
+            pp::EMOJI_WARNING,
+            "CF_ACCOUNT_ID is deprecated and ignored since v1.14.0",
+        );
+    }
+
+    None
+}
+
+fn read_providers_from_env(ppfmt: &PP) -> Result<HashMap<IpType, ProviderType>, String> {
+    let mut providers = HashMap::new();
+
+    let ip4_str = getenv("IP4_PROVIDER").or_else(|| {
+        let val = getenv("IP4_POLICY");
+        if val.is_some() {
+            ppfmt.warningf(
+                pp::EMOJI_WARNING,
+                "IP4_POLICY is deprecated; use IP4_PROVIDER instead",
+            );
+        }
+        val
+    });
+    let ip6_str = getenv("IP6_PROVIDER").or_else(|| {
+        let val = getenv("IP6_POLICY");
+        if val.is_some() {
+            ppfmt.warningf(
+                pp::EMOJI_WARNING,
+                "IP6_POLICY is deprecated; use IP6_PROVIDER instead",
+            );
+        }
+        val
+    });
+
+    let ip4_provider = match ip4_str {
+        Some(s) => ProviderType::parse(&s).map_err(|e| format!("Invalid IP4_PROVIDER: {e}"))?,
+        None => ProviderType::CloudflareTrace { url: None },
+    };
+
+    let ip6_provider = match ip6_str {
+        Some(s) => ProviderType::parse(&s).map_err(|e| format!("Invalid IP6_PROVIDER: {e}"))?,
+        None => ProviderType::CloudflareTrace { url: None },
+    };
+
+    if !matches!(ip4_provider, ProviderType::None) {
+        providers.insert(IpType::V4, ip4_provider);
+    }
+    if !matches!(ip6_provider, ProviderType::None) {
+        providers.insert(IpType::V6, ip6_provider);
+    }
+
+    Ok(providers)
+}
+
+fn read_domains_from_env(_ppfmt: &PP) -> HashMap<IpType, Vec<String>> {
+    read_domains_with_suffix("")
+}
+
+/// Reads DOMAINS/IP4_DOMAINS/IP6_DOMAINS with a group suffix ("" or "_2").
+fn read_domains_with_suffix(suffix: &str) -> HashMap<IpType, Vec<String>> {
+    let mut domains: HashMap<IpType, Vec<String>> = HashMap::new();
+
+    let both = getenv_list(&format!("DOMAINS{suffix}"), ',');
+    let ip4_only = getenv_list(&format!("IP4_DOMAINS{suffix}"), ',');
+    let ip6_only = getenv_list(&format!("IP6_DOMAINS{suffix}"), ',');
+
+    let mut v4_domains: Vec<String> = both.clone();
+    v4_domains.extend(ip4_only);
+    if !v4_domains.is_empty() {
+        domains.insert(IpType::V4, v4_domains);
+    }
+
+    let mut v6_domains: Vec<String> = both;
+    v6_domains.extend(ip6_only);
+    if !v6_domains.is_empty() {
+        domains.insert(IpType::V6, v6_domains);
+    }
+
+    domains
+}
+
+/// Env var prefixes that can carry a detection group suffix (`_2`, `_3`, ...).
+const GROUP_VAR_PREFIXES: [&str; 5] = [
+    "DOMAINS_",
+    "IP4_DOMAINS_",
+    "IP6_DOMAINS_",
+    "IP4_PROVIDER_",
+    "IP6_PROVIDER_",
+];
+
+/// Numeric suffixes of set group variables, sorted. `_1`/`_01` are rejected:
+/// the unsuffixed variables are the first group.
+fn group_numbers() -> Result<Vec<u32>, String> {
+    let mut numbers = std::collections::BTreeSet::new();
+    for (key, value) in env::vars() {
+        if value.trim().is_empty() {
+            continue;
+        }
+        for prefix in GROUP_VAR_PREFIXES {
+            let Some(n) = key.strip_prefix(prefix) else {
+                continue;
+            };
+            if n.is_empty() || !n.chars().all(|c| c.is_ascii_digit()) {
+                continue;
+            }
+            match n.parse::<u32>() {
+                Ok(num) if num >= 2 && !n.starts_with('0') => {
+                    numbers.insert(num);
+                }
+                _ => {
+                    return Err(format!(
+                        "{key}: numbered groups start at _2; use the unsuffixed {} for the first group",
+                        prefix.trim_end_matches('_')
+                    ))
+                }
+            }
+        }
+    }
+    Ok(numbers.into_iter().collect())
+}
+
+/// Reads the numbered detection groups. A group without its own provider for a
+/// family inherits the default group's provider for that family.
+fn read_extra_groups(
+    default_providers: &HashMap<IpType, ProviderType>,
+    ppfmt: &PP,
+) -> Result<Vec<DetectionGroup>, String> {
+    let mut groups = Vec::new();
+    for n in group_numbers()? {
+        let suffix = format!("_{n}");
+        let domains = read_domains_with_suffix(&suffix);
+
+        let mut providers = HashMap::new();
+        for (ip_type, var) in [(IpType::V4, "IP4_PROVIDER"), (IpType::V6, "IP6_PROVIDER")] {
+            let key = format!("{var}{suffix}");
+            let provider = match getenv(&key) {
+                Some(s) => ProviderType::parse(&s).map_err(|e| format!("Invalid {key}: {e}"))?,
+                None => match default_providers.get(&ip_type) {
+                    Some(p) => p.clone(),
+                    None => ProviderType::None,
+                },
+            };
+            if !matches!(provider, ProviderType::None) {
+                providers.insert(ip_type, provider);
+            }
+        }
+
+        if domains.is_empty() {
+            ppfmt.warningf(
+                pp::EMOJI_WARNING,
+                &format!("Detection group {n} has no DOMAINS{suffix}, IP4_DOMAINS{suffix} or IP6_DOMAINS{suffix}; ignoring it"),
+            );
+            continue;
+        }
+        groups.push(DetectionGroup {
+            label: n.to_string(),
+            providers,
+            domains,
+        });
+    }
+    Ok(groups)
+}
+
+/// Each (domain, record type) may belong to only one group; otherwise two
+/// groups would overwrite each other's records every cycle.
+fn check_group_overlap(
+    default_domains: &HashMap<IpType, Vec<String>>,
+    groups: &[DetectionGroup],
+) -> Result<(), String> {
+    let mut owner: HashMap<(IpType, String), String> = HashMap::new();
+    let all = std::iter::once(("default".to_string(), default_domains))
+        .chain(groups.iter().map(|g| (format!("group {}", g.label), &g.domains)));
+    for (name, domains) in all {
+        for (ip_type, list) in domains {
+            for d in list {
+                let key = (*ip_type, d.to_ascii_lowercase());
+                if let Some(prev) = owner.insert(key, name.clone()) {
+                    if prev != name {
+                        return Err(format!(
+                            "{} record for {d} is configured in both the {prev} and {name} detection groups",
+                            ip_type.record_type()
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn read_waf_lists_from_env() -> Result<Vec<WAFList>, String> {
+    getenv_list("WAF_LISTS", ',')
+        .iter()
+        .map(|s| WAFList::parse(s).map_err(|e| format!("Invalid WAF_LISTS entry: {e}")))
+        .collect()
+}
+
+fn read_cron_from_env(ppfmt: &PP) -> Result<CronSchedule, String> {
+    match getenv("UPDATE_CRON") {
+        Some(s) => {
+            let s = s.trim();
+            if s == "@once" {
+                Ok(CronSchedule::Once)
+            } else if s == "@disabled" || s == "@nevermore" {
+                ppfmt.warningf(
+                    pp::EMOJI_WARNING,
+                    &format!("UPDATE_CRON={s} is deprecated; use @once instead"),
+                );
+                Ok(CronSchedule::Once)
+            } else if let Some(rest) = s.strip_prefix("@every ") {
+                match parse_duration_string(rest) {
+                    Some(d) if d < MIN_UPDATE_INTERVAL => {
+                        ppfmt.warningf(
+                            pp::EMOJI_WARNING,
+                            &format!(
+                                "UPDATE_CRON={s} is below the minimum interval; using @every {}s",
+                                MIN_UPDATE_INTERVAL.as_secs()
+                            ),
+                        );
+                        Ok(CronSchedule::Every(MIN_UPDATE_INTERVAL))
+                    }
+                    Some(d) => Ok(CronSchedule::Every(d)),
+                    None => Err(format!("Invalid duration in UPDATE_CRON: {s}")),
+                }
+            } else {
+                Err(format!(
+                    "Unsupported UPDATE_CRON format: {s}. Use @every <duration>, @once, or omit for default (5m)."
+                ))
+            }
+        }
+        None => Ok(CronSchedule::Every(Duration::from_secs(300))),
+    }
+}
+
+/// Reads an optional regex. An invalid regex is a hard error: falling back to
+/// `None` would mean "manage every record", which can delete hand-made records.
+fn read_regex(key: &str) -> Result<Option<regex_lite::Regex>, String> {
+    match getenv(key) {
+        Some(s) => regex_lite::Regex::new(&s)
+            .map(Some)
+            .map_err(|e| format!("Invalid regex in {key}: {e}")),
+        None => Ok(None),
+    }
+}
+
+// ============================================================
+// JSON Config File with Env Var Substitution (legacy mode)
+// ============================================================
+
+fn substitute_env_vars(input: &str) -> String {
+    let mut result = input.to_string();
+    // Longest names first so $CF_DDNS_TOKEN never clobbers part of $CF_DDNS_TOKEN_2.
+    let mut vars: Vec<(String, String)> = env::vars()
+        .filter(|(k, _)| k.starts_with("CF_DDNS_"))
+        .collect();
+    vars.sort_by_key(|(k, _)| std::cmp::Reverse(k.len()));
+    for (key, value) in vars {
+        result = result.replace(&format!("${{{key}}}"), value.as_str());
+        result = result.replace(&format!("${key}"), value.as_str());
+    }
+    if result.contains("$CF_DDNS_") || result.contains("${CF_DDNS_") {
+        eprintln!(
+            "Warning: config.json references a CF_DDNS_* environment variable that is not set"
+        );
+    }
+    result
+}
+
+/// The Docker image runs as UID 65534, so a mounted file that only its
+/// owner can read (mode 600) fails with "permission denied". Say how to fix it.
+fn permission_hint(e: &std::io::Error) -> &'static str {
+    if e.kind() == std::io::ErrorKind::PermissionDenied {
+        ". The Docker image runs as an unprivileged user (UID 65534): make the file \
+         readable by that user (e.g. chmod 644), or run the container with --user \
+         set to the file's owner"
+    } else {
+        ""
+    }
+}
+
+pub fn load_legacy_config() -> Result<LegacyConfig, String> {
+    let config_path = env::var("CONFIG_PATH").unwrap_or_else(|_| ".".to_string());
+    let path = PathBuf::from(&config_path).join("config.json");
+
+    let content = std::fs::read_to_string(&path)
+        .map_err(|e| format!("Error reading config.json: {e}{}", permission_hint(&e)))?;
+
+    let content = substitute_env_vars(&content);
+
+    let mut config: LegacyConfig =
+        serde_json::from_str(&content).map_err(|e| format!("Error parsing config.json: {e}"))?;
+
+    if config.ttl < 30 {
+        println!("TTL is too low - defaulting to 1 (auto)");
+        config.ttl = 1;
+    }
+
+    Ok(config)
+}
+
+#[cfg(test)]
+pub fn parse_legacy_config(content: &str) -> Result<LegacyConfig, String> {
+    let mut config: LegacyConfig =
+        serde_json::from_str(content).map_err(|e| format!("Error parsing config: {e}"))?;
+
+    if config.ttl < 30 {
+        config.ttl = 1;
+    }
+
+    Ok(config)
+}
+
+/// Convert a legacy config into a unified AppConfig
+fn legacy_to_app_config(
+    mut legacy: LegacyConfig,
+    dry_run: bool,
+    repeat: bool,
+) -> Result<AppConfig, String> {
+    // Validate every entry's credentials up front; an empty token used to become
+    // a bare "Bearer " header and fail every cycle with Cloudflare error 6111.
+    let ppfmt = PP::new(false, false);
+    for (i, entry) in legacy.cloudflare.iter_mut().enumerate() {
+        let auth = &mut entry.authentication;
+        let has_token = !auth.api_token.trim().is_empty() && auth.api_token != "api_token_here";
+        if has_token {
+            auth.api_token =
+                normalize_token(&auth.api_token, &format!("cloudflare[{i}].authentication.api_token"), &ppfmt)?;
+        } else if auth.api_key.is_none() {
+            return Err(format!(
+                "config.json: cloudflare[{i}] has no api_token or api_key credentials"
+            ));
+        }
+    }
+
+    // Extract auth from first entry
+    let auth = if let Some(entry) = legacy.cloudflare.first() {
+        if !entry.authentication.api_token.is_empty()
+            && entry.authentication.api_token != "api_token_here"
+        {
+            Auth::Token(entry.authentication.api_token.clone())
+        } else if let Some(api_key) = &entry.authentication.api_key {
+            Auth::Key {
+                api_key: api_key.api_key.clone(),
+                email: api_key.account_email.clone(),
+            }
+        } else {
+            Auth::Token(String::new())
+        }
+    } else {
+        Auth::Token(String::new())
+    };
+
+    // Build providers — ip4_provider/ip6_provider override the default cloudflare.trace
+    let mut providers = HashMap::new();
+    if legacy.a {
+        let provider = match &legacy.ip4_provider {
+            Some(s) => ProviderType::parse(s)
+                .map_err(|e| format!("Invalid ip4_provider in config.json: {e}"))?,
+            None => ProviderType::CloudflareTrace { url: None },
+        };
+        if !matches!(provider, ProviderType::None) {
+            providers.insert(IpType::V4, provider);
+        }
+    }
+    if legacy.aaaa {
+        let provider = match &legacy.ip6_provider {
+            Some(s) => ProviderType::parse(s)
+                .map_err(|e| format!("Invalid ip6_provider in config.json: {e}"))?,
+            None => ProviderType::CloudflareTrace { url: None },
+        };
+        if !matches!(provider, ProviderType::None) {
+            providers.insert(IpType::V6, provider);
+        }
+    }
+
+    let ttl = TTL::new(legacy.ttl);
+    let schedule = if repeat {
+        // Legacy mode polls every TTL seconds. TTL 1 means "auto" (and any TTL
+        // below 30 is rewritten to 1), which must not become a 1-second loop.
+        let secs = if legacy.ttl < MIN_UPDATE_INTERVAL.as_secs() as i64 {
+            LEGACY_AUTO_TTL_INTERVAL
+        } else {
+            Duration::from_secs(legacy.ttl as u64)
+        };
+        CronSchedule::Every(secs)
+    } else {
+        CronSchedule::Once
+    };
+
+    Ok(AppConfig {
+        auth,
+        providers,
+        domains: HashMap::new(),
+        extra_groups: Vec::new(),
+        waf_lists: Vec::new(),
+        update_cron: schedule,
+        update_on_start: true,
+        delete_on_stop: false,
+        delete_on_failure: false,
+        ttl,
+        proxied_expression: None,
+        record_comment: legacy.record_comment.clone(),
+        managed_comment_regex: None,
+        waf_list_description: None,
+        waf_list_item_comment: None,
+        managed_waf_comment_regex: None,
+        detection_timeout: Duration::from_secs(5),
+        update_timeout: Duration::from_secs(30),
+        reject_cloudflare_ips: getenv_bool("REJECT_CLOUDFLARE_IPS", true),
+        dry_run,
+        emoji: false,
+        quiet: false,
+        legacy_mode: true,
+        legacy_config: Some(legacy),
+        repeat,
+    })
+}
+
+// ============================================================
+// Detect config mode and load
+// ============================================================
+
+/// Determine whether to use env var config (cf-ddns mode) or legacy JSON config.
+pub fn is_env_config_mode() -> bool {
+    // If any cf-ddns env vars are set, use env mode
+    getenv("CLOUDFLARE_API_TOKEN").is_some()
+        || getenv("CF_API_TOKEN").is_some()
+        || getenv("CLOUDFLARE_API_TOKEN_FILE").is_some()
+        || getenv("CF_API_TOKEN_FILE").is_some()
+        || getenv("DOMAINS").is_some()
+        || getenv("IP4_DOMAINS").is_some()
+        || getenv("IP6_DOMAINS").is_some()
+        || env::vars().any(|(k, v)| {
+            !v.trim().is_empty()
+                && ["DOMAINS_", "IP4_DOMAINS_", "IP6_DOMAINS_"]
+                    .iter()
+                    .any(|p| k.strip_prefix(p).is_some_and(|n| n.chars().all(|c| c.is_ascii_digit())))
+        })
+}
+
+/// Load configuration from environment variables (cf-ddns mode).
+pub fn load_env_config(ppfmt: &PP) -> Result<AppConfig, String> {
+    // Deprecated warnings
+    if getenv("PUID").is_some() {
+        ppfmt.warningf(pp::EMOJI_WARNING, "PUID is deprecated since v1.13.0 and ignored. Use Docker's built-in mechanism instead.");
+    }
+    if getenv("PGID").is_some() {
+        ppfmt.warningf(pp::EMOJI_WARNING, "PGID is deprecated since v1.13.0 and ignored. Use Docker's built-in mechanism instead.");
+    }
+
+    let auth = read_auth_from_env(ppfmt)
+        .ok_or_else(|| "No valid authentication configured. Set CLOUDFLARE_API_TOKEN.".to_string())?;
+
+    let providers = read_providers_from_env(ppfmt)?;
+    let domains = read_domains_from_env(ppfmt);
+    let extra_groups = read_extra_groups(&providers, ppfmt)?;
+    check_group_overlap(&domains, &extra_groups)?;
+    let waf_lists = read_waf_lists_from_env()?;
+    let update_cron = read_cron_from_env(ppfmt)?;
+    let update_on_start = getenv_bool("UPDATE_ON_START", true);
+    let delete_on_stop = getenv_bool("DELETE_ON_STOP", false);
+    let delete_on_failure = getenv_bool("DELETE_ON_FAILURE", false);
+
+    let ttl_val = match getenv("TTL") {
+        Some(s) => s
+            .parse::<i64>()
+            .map_err(|_| format!("Invalid TTL: '{s}'. Use 1 (auto) or a number of seconds."))?,
+        None => 1,
+    };
+    let ttl = TTL::new(ttl_val);
+
+    let proxied_expr_str = getenv("PROXIED").unwrap_or_else(|| "false".to_string());
+    // An invalid expression must not silently fall back to "not proxied": that
+    // would expose the origin IP the user meant to hide.
+    let proxied_expression = Some(
+        domain::parse_proxied_expression(&proxied_expr_str)
+            .map_err(|e| format!("Invalid PROXIED expression: {e}"))?,
+    );
+
+    let record_comment = getenv("RECORD_COMMENT");
+    let managed_comment_regex = read_regex("MANAGED_RECORDS_COMMENT_REGEX")?;
+    let waf_list_description = getenv("WAF_LIST_DESCRIPTION");
+    let waf_list_item_comment = getenv("WAF_LIST_ITEM_COMMENT");
+    let managed_waf_comment_regex = read_regex("MANAGED_WAF_LIST_ITEMS_COMMENT_REGEX")?;
+
+    let detection_timeout = getenv_duration("DETECTION_TIMEOUT", Duration::from_secs(5))?;
+    let update_timeout = getenv_duration("UPDATE_TIMEOUT", Duration::from_secs(30))?;
+
+    let emoji = getenv_bool("EMOJI", true);
+    let quiet = getenv_bool("QUIET", false);
+    let reject_cloudflare_ips = getenv_bool("REJECT_CLOUDFLARE_IPS", true);
+
+    // Validate: must have at least one update target
+    if domains.is_empty() && extra_groups.is_empty() && waf_lists.is_empty() {
+        return Err(
+            "No update targets configured. Set DOMAINS, IP4_DOMAINS, IP6_DOMAINS, or WAF_LISTS."
+                .to_string(),
+        );
+    }
+
+    // Validate: @once constraints
+    if matches!(update_cron, CronSchedule::Once) {
+        if !update_on_start {
+            return Err("UPDATE_ON_START must be true when UPDATE_CRON=@once".to_string());
+        }
+        if delete_on_stop {
+            return Err("DELETE_ON_STOP must be false when UPDATE_CRON=@once".to_string());
+        }
+    }
+
+    // Validate comment/regex compatibility
+    if let (Some(ref comment), Some(ref regex)) = (&record_comment, &managed_comment_regex) {
+        if !regex.is_match(comment) {
+            ppfmt.warningf(
+                pp::EMOJI_WARNING,
+                &format!(
+                    "RECORD_COMMENT '{}' does not match MANAGED_RECORDS_COMMENT_REGEX '{}'",
+                    comment,
+                    regex.as_str()
+                ),
+            );
+        }
+    }
+
+    Ok(AppConfig {
+        auth,
+        providers,
+        domains,
+        extra_groups,
+        waf_lists,
+        update_cron,
+        update_on_start,
+        delete_on_stop,
+        delete_on_failure,
+        ttl,
+        proxied_expression,
+        record_comment,
+        managed_comment_regex,
+        waf_list_description,
+        waf_list_item_comment,
+        managed_waf_comment_regex,
+        detection_timeout,
+        update_timeout,
+        reject_cloudflare_ips,
+        dry_run: false, // Set later from CLI args
+        emoji,
+        quiet,
+        legacy_mode: false,
+        legacy_config: None,
+        repeat: false, // Set later
+    })
+}
+
+/// Load config (auto-detect mode).
+pub fn load_config(dry_run: bool, repeat: bool, ppfmt: &PP) -> Result<AppConfig, String> {
+    if is_env_config_mode() {
+        ppfmt.infof(pp::EMOJI_CONFIG, "Using environment variable configuration");
+        let mut config = load_env_config(ppfmt)?;
+        config.dry_run = dry_run;
+        config.repeat = !matches!(config.update_cron, CronSchedule::Once);
+        Ok(config)
+    } else {
+        ppfmt.infof(pp::EMOJI_CONFIG, "Using config.json configuration");
+        let legacy = load_legacy_config()?;
+        legacy_to_app_config(legacy, dry_run, repeat)
+    }
+}
+
+// ============================================================
+// Setup reporters (notifiers + heartbeats)
+// ============================================================
+
+pub fn setup_notifiers(ppfmt: &PP) -> CompositeNotifier {
+    let mut notifiers: Vec<Box<dyn NotifierDyn>> = Vec::new();
+
+    let shoutrrr_urls = getenv_list("SHOUTRRR", '\n');
+    if !shoutrrr_urls.is_empty() {
+        match ShoutrrrNotifier::new(&shoutrrr_urls) {
+            Ok(n) => {
+                ppfmt.infof(
+                    pp::EMOJI_NOTIFY,
+                    &format!("Notifications: {}", n.describe()),
+                );
+                notifiers.push(Box::new(n.with_pp(same_output(ppfmt))));
+            }
+            Err(e) => {
+                ppfmt.errorf(
+                    pp::EMOJI_ERROR,
+                    &format!("Failed to setup notifications: {e}"),
+                );
+            }
+        }
+    }
+
+    CompositeNotifier::new(notifiers)
+}
+
+/// A top-level printer with the same QUIET/EMOJI settings as `ppfmt`.
+fn same_output(ppfmt: &PP) -> PP {
+    PP::new(ppfmt.emoji, ppfmt.verbosity == pp::Verbosity::Quiet)
+}
+
+pub fn setup_heartbeats(ppfmt: &PP) -> Heartbeat {
+    let mut monitors: Vec<Box<dyn HeartbeatMonitor>> = Vec::new();
+
+    if let Some(url) = getenv("HEALTHCHECKS") {
+        ppfmt.infof(pp::EMOJI_HEARTBEAT, "Heartbeat: Healthchecks.io");
+        monitors.push(Box::new(HealthchecksMonitor::new(&url)));
+    }
+
+    if let Some(url) = getenv("UPTIMEKUMA") {
+        ppfmt.infof(pp::EMOJI_HEARTBEAT, "Heartbeat: Uptime Kuma");
+        monitors.push(Box::new(UptimeKumaMonitor::new(&url)));
+    }
+
+    Heartbeat::new(monitors).with_pp(same_output(ppfmt))
+}
+
+// ============================================================
+// Print config summary
+// ============================================================
+
+pub fn print_config_summary(config: &AppConfig, ppfmt: &PP) {
+    if config.legacy_mode {
+        // Legacy mode output (backwards compatible)
+        return;
+    }
+
+    let inner = ppfmt.indent();
+
+    for group in config.groups() {
+        if group.domains.is_empty() {
+            continue;
+        }
+        ppfmt.noticef(pp::EMOJI_CONFIG, &format!("Domains to update{}:", group.tag()));
+        for (ip_type, domains) in group.domains {
+            let provider = group
+                .providers
+                .get(ip_type)
+                .map(|p| p.label())
+                .unwrap_or_else(|| "none".to_string());
+            inner.noticef(
+                "",
+                &format!("{} via {provider}: {}", ip_type.describe(), domains.join(", ")),
+            );
+        }
+    }
+
+    if !config.waf_lists.is_empty() {
+        ppfmt.noticef(pp::EMOJI_CONFIG, "WAF lists:");
+        for waf in &config.waf_lists {
+            inner.noticef("", &waf.describe());
+        }
+    }
+
+    if config.domains.is_empty() {
+        for (ip_type, provider) in &config.providers {
+            inner.infof(
+                "",
+                &format!("{} provider: {}", ip_type.describe(), provider.label()),
+            );
+        }
+    }
+
+    inner.infof("", &format!("TTL: {}", config.ttl.describe()));
+    inner.infof("", &format!("Schedule: {}", config.update_cron.describe()));
+
+    if config.delete_on_stop {
+        inner.infof("", "Delete on stop: enabled");
+    }
+
+    if !config.reject_cloudflare_ips {
+        inner.warningf(
+            "",
+            "Cloudflare IP rejection: DISABLED (REJECT_CLOUDFLARE_IPS=false)",
+        );
+    }
+
+    if let Some(ref comment) = config.record_comment {
+        inner.infof("", &format!("Record comment: {comment}"));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_legacy_config_minimal() {
+        let json = r#"{
+            "cloudflare": [{
+                "authentication": { "api_token": "tok123" },
+                "zone_id": "zone1",
+                "subdomains": ["@"]
+            }]
+        }"#;
+        let config = parse_legacy_config(json).unwrap();
+        assert!(config.a);
+        assert!(config.aaaa);
+        assert!(!config.purge_unknown_records);
+        assert_eq!(config.ttl, 300);
+    }
+
+    #[test]
+    fn test_parse_legacy_config_low_ttl() {
+        let json = r#"{
+            "cloudflare": [{
+                "authentication": { "api_token": "tok123" },
+                "zone_id": "zone1",
+                "subdomains": ["@"]
+            }],
+            "ttl": 10
+        }"#;
+        let config = parse_legacy_config(json).unwrap();
+        assert_eq!(config.ttl, 1);
+    }
+
+    #[test]
+    fn test_cron_schedule_every() {
+        let sched = CronSchedule::Every(Duration::from_secs(300));
+        assert_eq!(sched.next_duration(), Some(Duration::from_secs(300)));
+    }
+
+    #[test]
+    fn test_cron_schedule_once() {
+        let sched = CronSchedule::Once;
+        assert_eq!(sched.next_duration(), None);
+    }
+
+    #[test]
+    fn test_parse_duration_string() {
+        assert_eq!(parse_duration_string("5m"), Some(Duration::from_secs(300)));
+        assert_eq!(parse_duration_string("1h"), Some(Duration::from_secs(3600)));
+        assert_eq!(parse_duration_string("30s"), Some(Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn test_substitute_env_vars() {
+        std::env::set_var("CF_DDNS_TEST_VAR", "test_value");
+        let result = substitute_env_vars("token: ${CF_DDNS_TEST_VAR}");
+        assert_eq!(result, "token: test_value");
+        let result2 = substitute_env_vars("token: $CF_DDNS_TEST_VAR");
+        assert_eq!(result2, "token: test_value");
+        std::env::remove_var("CF_DDNS_TEST_VAR");
+    }
+
+    // --- parse_duration_string edge cases ---
+
+    #[test]
+    fn test_parse_duration_string_plain_number() {
+        assert_eq!(parse_duration_string("60"), Some(Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn test_parse_duration_string_whitespace() {
+        assert_eq!(
+            parse_duration_string("  5m  "),
+            Some(Duration::from_secs(300))
+        );
+    }
+
+    #[test]
+    fn test_parse_duration_string_invalid() {
+        assert_eq!(parse_duration_string("abc"), None);
+        assert_eq!(parse_duration_string(""), None);
+    }
+
+    // --- CronSchedule ---
+
+    #[test]
+    fn test_cron_schedule_describe() {
+        assert_eq!(
+            CronSchedule::Every(Duration::from_secs(300)).describe(),
+            "@every 300s"
+        );
+        assert_eq!(CronSchedule::Once.describe(), "@once");
+    }
+
+    // --- read_cron_from_env ---
+
+    #[test]
+    fn test_read_cron_default() {
+        let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        // No env var set -> default 5m
+        std::env::remove_var("UPDATE_CRON");
+        let pp = PP::new(false, false);
+        let sched = read_cron_from_env(&pp).unwrap();
+        assert!(matches!(sched, CronSchedule::Every(d) if d == Duration::from_secs(300)));
+    }
+
+    #[test]
+    fn test_read_cron_once() {
+        let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("UPDATE_CRON", "@once");
+        let pp = PP::new(false, false);
+        let sched = read_cron_from_env(&pp).unwrap();
+        assert!(matches!(sched, CronSchedule::Once));
+        std::env::remove_var("UPDATE_CRON");
+    }
+
+    #[test]
+    fn test_read_cron_every() {
+        let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("UPDATE_CRON", "@every 10m");
+        let pp = PP::new(false, false);
+        let sched = read_cron_from_env(&pp).unwrap();
+        assert!(matches!(sched, CronSchedule::Every(d) if d == Duration::from_secs(600)));
+        std::env::remove_var("UPDATE_CRON");
+    }
+
+    #[test]
+    fn test_read_cron_deprecated_disabled() {
+        let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("UPDATE_CRON", "@disabled");
+        let pp = PP::new(false, false);
+        let sched = read_cron_from_env(&pp).unwrap();
+        assert!(matches!(sched, CronSchedule::Once));
+        std::env::remove_var("UPDATE_CRON");
+    }
+
+    #[test]
+    fn test_read_cron_unsupported_format() {
+        let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("UPDATE_CRON", "*/5 * * * *");
+        let pp = PP::new(false, false);
+        let result = read_cron_from_env(&pp);
+        assert!(result.is_err());
+        std::env::remove_var("UPDATE_CRON");
+    }
+
+    // --- getenv helpers ---
+
+    #[test]
+    fn test_getenv_empty_string_is_none() {
+        std::env::set_var("TEST_GETENV_EMPTY", "");
+        assert!(getenv("TEST_GETENV_EMPTY").is_none());
+        std::env::remove_var("TEST_GETENV_EMPTY");
+    }
+
+    #[test]
+    fn test_getenv_whitespace_is_none() {
+        std::env::set_var("TEST_GETENV_WS", "   ");
+        assert!(getenv("TEST_GETENV_WS").is_none());
+        std::env::remove_var("TEST_GETENV_WS");
+    }
+
+    #[test]
+    fn test_getenv_trims() {
+        std::env::set_var("TEST_GETENV_TRIM", "  hello  ");
+        assert_eq!(getenv("TEST_GETENV_TRIM"), Some("hello".to_string()));
+        std::env::remove_var("TEST_GETENV_TRIM");
+    }
+
+    #[test]
+    fn test_getenv_bool_true_values() {
+        for val in &["true", "1", "yes", "True", "YES"] {
+            std::env::set_var("TEST_BOOL_TRUE", val);
+            assert!(getenv_bool("TEST_BOOL_TRUE", false));
+        }
+        std::env::remove_var("TEST_BOOL_TRUE");
+    }
+
+    #[test]
+    fn test_getenv_bool_false_values() {
+        for val in &["false", "0", "no", "anything"] {
+            std::env::set_var("TEST_BOOL_FALSE", val);
+            assert!(!getenv_bool("TEST_BOOL_FALSE", true));
+        }
+        std::env::remove_var("TEST_BOOL_FALSE");
+    }
+
+    #[test]
+    fn test_getenv_bool_default() {
+        std::env::remove_var("TEST_BOOL_MISSING");
+        assert!(getenv_bool("TEST_BOOL_MISSING", true));
+        assert!(!getenv_bool("TEST_BOOL_MISSING", false));
+    }
+
+    #[test]
+    fn test_getenv_duration_valid() {
+        std::env::set_var("TEST_DUR", "10s");
+        let d = getenv_duration("TEST_DUR", Duration::from_secs(99));
+        assert_eq!(d, Ok(Duration::from_secs(10)));
+        std::env::remove_var("TEST_DUR");
+    }
+
+    #[test]
+    fn test_getenv_duration_invalid_is_error() {
+        for bad in ["500ms", "abc", "0", "0s"] {
+            std::env::set_var("TEST_DUR_BAD", bad);
+            let err = getenv_duration("TEST_DUR_BAD", Duration::from_secs(5)).unwrap_err();
+            assert!(err.contains("TEST_DUR_BAD"), "{bad}: {err}");
+        }
+        std::env::remove_var("TEST_DUR_BAD");
+    }
+
+    #[test]
+    fn test_parse_duration_overflow_is_none() {
+        assert_eq!(parse_duration_string(&format!("{}h", u64::MAX)), None);
+        assert_eq!(parse_duration_string(&format!("{}m", u64::MAX)), None);
+    }
+
+    #[test]
+    fn test_getenv_duration_default() {
+        std::env::remove_var("TEST_DUR_MISSING");
+        let d = getenv_duration("TEST_DUR_MISSING", Duration::from_secs(42));
+        assert_eq!(d, Ok(Duration::from_secs(42)));
+    }
+
+    #[test]
+    fn test_getenv_list() {
+        std::env::set_var("TEST_LIST", "a,b,,c");
+        let list = getenv_list("TEST_LIST", ',');
+        assert_eq!(list, vec!["a", "b", "c"]);
+        std::env::remove_var("TEST_LIST");
+    }
+
+    #[test]
+    fn test_getenv_list_empty() {
+        std::env::remove_var("TEST_LIST_MISSING");
+        let list = getenv_list("TEST_LIST_MISSING", ',');
+        assert!(list.is_empty());
+    }
+
+    // --- read_regex ---
+
+    #[test]
+    fn test_read_regex_valid() {
+        std::env::set_var("TEST_REGEX", "cloudflare-ddns");
+        let regex = read_regex("TEST_REGEX").unwrap();
+        assert!(regex.is_some());
+        assert!(regex.unwrap().is_match("managed by cloudflare-ddns"));
+        std::env::remove_var("TEST_REGEX");
+    }
+
+    #[test]
+    fn test_read_regex_invalid_is_error() {
+        // Fail closed: an invalid regex must not mean "manage all records".
+        std::env::set_var("TEST_REGEX_BAD", "[invalid(");
+        let err = read_regex("TEST_REGEX_BAD").unwrap_err();
+        assert!(err.contains("TEST_REGEX_BAD"));
+        std::env::remove_var("TEST_REGEX_BAD");
+    }
+
+    #[test]
+    fn test_read_regex_empty() {
+        std::env::set_var("TEST_REGEX_E", "");
+        let regex = read_regex("TEST_REGEX_E").unwrap();
+        assert!(regex.is_none());
+        std::env::remove_var("TEST_REGEX_E");
+    }
+
+    // --- read_domains_from_env ---
+
+    #[test]
+    fn test_read_domains_both() {
+        let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("DOMAINS", "example.com,www.example.com");
+        std::env::remove_var("IP4_DOMAINS");
+        std::env::remove_var("IP6_DOMAINS");
+        let pp = PP::new(false, false);
+        let domains = read_domains_from_env(&pp);
+        assert_eq!(domains.get(&IpType::V4).unwrap().len(), 2);
+        assert_eq!(domains.get(&IpType::V6).unwrap().len(), 2);
+        std::env::remove_var("DOMAINS");
+    }
+
+    #[test]
+    fn test_read_domains_ip4_only() {
+        let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("DOMAINS");
+        std::env::set_var("IP4_DOMAINS", "v4.example.com");
+        std::env::remove_var("IP6_DOMAINS");
+        let pp = PP::new(false, false);
+        let domains = read_domains_from_env(&pp);
+        assert_eq!(
+            domains.get(&IpType::V4).unwrap(),
+            &vec!["v4.example.com".to_string()]
+        );
+        assert!(domains.get(&IpType::V6).is_none());
+        std::env::remove_var("IP4_DOMAINS");
+    }
+
+    #[test]
+    fn test_read_domains_empty() {
+        let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("DOMAINS");
+        std::env::remove_var("IP4_DOMAINS");
+        std::env::remove_var("IP6_DOMAINS");
+        let pp = PP::new(false, false);
+        let domains = read_domains_from_env(&pp);
+        assert!(domains.is_empty());
+    }
+
+    // --- read_waf_lists_from_env ---
+
+    #[test]
+    fn test_read_waf_lists_valid() {
+        let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("WAF_LISTS", "acc123/my_list");
+        let lists = read_waf_lists_from_env().unwrap();
+        assert_eq!(lists.len(), 1);
+        assert_eq!(lists[0].account_id, "acc123");
+        assert_eq!(lists[0].list_name, "my_list");
+        std::env::remove_var("WAF_LISTS");
+    }
+
+    #[test]
+    fn test_read_waf_lists_invalid_is_error() {
+        let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("WAF_LISTS", "no-slash");
+        assert!(read_waf_lists_from_env().is_err());
+        std::env::remove_var("WAF_LISTS");
+    }
+
+    // --- legacy_to_app_config ---
+
+    #[test]
+    fn test_legacy_to_app_config_basic() {
+        let legacy = LegacyConfig {
+            cloudflare: vec![LegacyCloudflareEntry {
+                authentication: LegacyAuthentication {
+                    api_token: "my-token".to_string(),
+                    api_key: None,
+                },
+                zone_id: "zone1".to_string(),
+                subdomains: vec![LegacySubdomainEntry::Simple("@".to_string())],
+                proxied: false,
+            }],
+            a: true,
+            aaaa: false,
+            purge_unknown_records: false,
+            ttl: 300,
+            ip4_provider: None,
+            ip6_provider: None,
+            record_comment: None,
+        };
+        let config = legacy_to_app_config(legacy, false, false).unwrap();
+        assert!(config.legacy_mode);
+        assert!(matches!(config.auth, Auth::Token(ref t) if t == "my-token"));
+        assert!(config.providers.contains_key(&IpType::V4));
+        assert!(!config.providers.contains_key(&IpType::V6));
+        assert!(matches!(config.update_cron, CronSchedule::Once));
+        assert!(!config.dry_run);
+    }
+
+    #[test]
+    fn test_legacy_to_app_config_repeat() {
+        let legacy = LegacyConfig {
+            cloudflare: vec![LegacyCloudflareEntry {
+                authentication: LegacyAuthentication {
+                    api_token: "tok".to_string(),
+                    api_key: None,
+                },
+                zone_id: "z".to_string(),
+                subdomains: vec![],
+                proxied: false,
+            }],
+            a: true,
+            aaaa: true,
+            purge_unknown_records: false,
+            ttl: 120,
+            ip4_provider: None,
+            ip6_provider: None,
+            record_comment: None,
+        };
+        let config = legacy_to_app_config(legacy, true, true).unwrap();
+        assert!(
+            matches!(config.update_cron, CronSchedule::Every(d) if d == Duration::from_secs(120))
+        );
+        assert!(config.repeat);
+        assert!(config.dry_run);
+    }
+
+    #[test]
+    fn test_legacy_to_app_config_api_key() {
+        let legacy = LegacyConfig {
+            cloudflare: vec![LegacyCloudflareEntry {
+                authentication: LegacyAuthentication {
+                    api_token: String::new(),
+                    api_key: Some(LegacyApiKey {
+                        api_key: "key123".to_string(),
+                        account_email: "test@example.com".to_string(),
+                    }),
+                },
+                zone_id: "z".to_string(),
+                subdomains: vec![],
+                proxied: false,
+            }],
+            a: true,
+            aaaa: true,
+            purge_unknown_records: false,
+            ttl: 300,
+            ip4_provider: None,
+            ip6_provider: None,
+            record_comment: None,
+        };
+        let config = legacy_to_app_config(legacy, false, false).unwrap();
+        assert!(matches!(config.auth, Auth::Key { ref api_key, ref email }
+            if api_key == "key123" && email == "test@example.com"));
+    }
+
+    #[test]
+    fn test_legacy_to_app_config_custom_providers() {
+        let legacy = LegacyConfig {
+            cloudflare: vec![LegacyCloudflareEntry {
+                authentication: LegacyAuthentication {
+                    api_token: "tok".to_string(),
+                    api_key: None,
+                },
+                zone_id: "z".to_string(),
+                subdomains: vec![],
+                proxied: false,
+            }],
+            a: true,
+            aaaa: true,
+            purge_unknown_records: false,
+            ttl: 300,
+            ip4_provider: Some("ipify".to_string()),
+            ip6_provider: Some("cloudflare.doh".to_string()),
+            record_comment: None,
+        };
+        let config = legacy_to_app_config(legacy, false, false).unwrap();
+        assert!(matches!(config.providers[&IpType::V4], ProviderType::Ipify));
+        assert!(matches!(
+            config.providers[&IpType::V6],
+            ProviderType::CloudflareDOH
+        ));
+    }
+
+    #[test]
+    fn test_legacy_to_app_config_provider_none_overrides_a_flag() {
+        let legacy = LegacyConfig {
+            cloudflare: vec![LegacyCloudflareEntry {
+                authentication: LegacyAuthentication {
+                    api_token: "tok".to_string(),
+                    api_key: None,
+                },
+                zone_id: "z".to_string(),
+                subdomains: vec![],
+                proxied: false,
+            }],
+            a: true,
+            aaaa: true,
+            purge_unknown_records: false,
+            ttl: 300,
+            ip4_provider: Some("none".to_string()),
+            ip6_provider: None,
+            record_comment: None,
+        };
+        let config = legacy_to_app_config(legacy, false, false).unwrap();
+        // ip4_provider=none should exclude V4 even though a=true
+        assert!(!config.providers.contains_key(&IpType::V4));
+        assert!(config.providers.contains_key(&IpType::V6));
+    }
+
+    #[test]
+    fn test_legacy_to_app_config_invalid_provider_returns_error() {
+        let legacy = LegacyConfig {
+            cloudflare: vec![LegacyCloudflareEntry {
+                authentication: LegacyAuthentication {
+                    api_token: "tok".to_string(),
+                    api_key: None,
+                },
+                zone_id: "z".to_string(),
+                subdomains: vec![],
+                proxied: false,
+            }],
+            a: true,
+            aaaa: false,
+            purge_unknown_records: false,
+            ttl: 300,
+            ip4_provider: Some("totally_invalid".to_string()),
+            ip6_provider: None,
+            record_comment: None,
+        };
+        let result = legacy_to_app_config(legacy, false, false);
+        assert!(result.is_err());
+        let err = result.err().unwrap();
+        assert!(err.contains("ip4_provider"));
+    }
+
+    #[test]
+    fn test_legacy_to_app_config_with_record_comment() {
+        let legacy = LegacyConfig {
+            cloudflare: vec![LegacyCloudflareEntry {
+                authentication: LegacyAuthentication {
+                    api_token: "tok".to_string(),
+                    api_key: None,
+                },
+                zone_id: "z".to_string(),
+                subdomains: vec![],
+                proxied: false,
+            }],
+            a: true,
+            aaaa: false,
+            purge_unknown_records: false,
+            ttl: 300,
+            ip4_provider: None,
+            ip6_provider: None,
+            record_comment: Some("managed by cloudflare-ddns".to_string()),
+        };
+        let config = legacy_to_app_config(legacy, false, false).unwrap();
+        assert_eq!(config.record_comment, Some("managed by cloudflare-ddns".to_string()));
+    }
+
+    #[test]
+    fn test_legacy_config_deserializes_providers() {
+        let json = r#"{
+            "cloudflare": [{
+                "authentication": { "api_token": "tok" },
+                "zone_id": "z",
+                "subdomains": ["@"]
+            }],
+            "ip4_provider": "ipify",
+            "ip6_provider": "none"
+        }"#;
+        let config = parse_legacy_config(json).unwrap();
+        assert_eq!(config.ip4_provider, Some("ipify".to_string()));
+        assert_eq!(config.ip6_provider, Some("none".to_string()));
+    }
+
+    #[test]
+    fn test_legacy_config_deserializes_record_comment() {
+        let json = r#"{
+            "cloudflare": [{
+                "authentication": { "api_token": "tok" },
+                "zone_id": "z",
+                "subdomains": ["@"]
+            }],
+            "recordComment": "managed by cloudflare-ddns"
+        }"#;
+        let config = parse_legacy_config(json).unwrap();
+        assert_eq!(config.record_comment, Some("managed by cloudflare-ddns".to_string()));
+    }
+
+    #[test]
+    fn test_legacy_config_deserializes_without_providers() {
+        let json = r#"{
+            "cloudflare": [{
+                "authentication": { "api_token": "tok" },
+                "zone_id": "z",
+                "subdomains": ["@"]
+            }]
+        }"#;
+        let config = parse_legacy_config(json).unwrap();
+        assert!(config.ip4_provider.is_none());
+        assert!(config.ip6_provider.is_none());
+    }
+
+    // --- is_env_config_mode ---
+
+    #[test]
+    fn test_is_env_config_mode_with_token() {
+        let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("CLOUDFLARE_API_TOKEN", "test");
+        assert!(is_env_config_mode());
+        std::env::remove_var("CLOUDFLARE_API_TOKEN");
+    }
+
+    #[test]
+    fn test_is_env_config_mode_with_domains() {
+        let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("CLOUDFLARE_API_TOKEN");
+        std::env::remove_var("CF_API_TOKEN");
+        std::env::remove_var("CLOUDFLARE_API_TOKEN_FILE");
+        std::env::remove_var("CF_API_TOKEN_FILE");
+        std::env::set_var("DOMAINS", "example.com");
+        assert!(is_env_config_mode());
+        std::env::remove_var("DOMAINS");
+    }
+
+    // --- parse_legacy_config edge cases ---
+
+    #[test]
+    fn test_parse_legacy_config_with_detailed_subdomains() {
+        let json = r#"{
+            "cloudflare": [{
+                "authentication": { "api_token": "tok" },
+                "zone_id": "z",
+                "subdomains": [
+                    { "name": "www", "proxied": true },
+                    "vpn"
+                ]
+            }]
+        }"#;
+        let config = parse_legacy_config(json).unwrap();
+        assert_eq!(config.cloudflare[0].subdomains.len(), 2);
+        match &config.cloudflare[0].subdomains[0] {
+            LegacySubdomainEntry::Detailed { name, proxied } => {
+                assert_eq!(name, "www");
+                assert!(*proxied);
+            }
+            _ => panic!("Expected Detailed"),
+        }
+        match &config.cloudflare[0].subdomains[1] {
+            LegacySubdomainEntry::Simple(name) => assert_eq!(name, "vpn"),
+            _ => panic!("Expected Simple"),
+        }
+    }
+
+    #[test]
+    fn test_parse_legacy_config_with_api_key() {
+        let json = r#"{
+            "cloudflare": [{
+                "authentication": {
+                    "api_key": {
+                        "api_key": "key123",
+                        "account_email": "user@example.com"
+                    }
+                },
+                "zone_id": "z",
+                "subdomains": ["@"]
+            }]
+        }"#;
+        let config = parse_legacy_config(json).unwrap();
+        let auth = &config.cloudflare[0].authentication;
+        assert!(auth.api_key.is_some());
+        assert_eq!(auth.api_key.as_ref().unwrap().api_key, "key123");
+    }
+
+    #[test]
+    fn test_parse_legacy_config_invalid_json() {
+        let result = parse_legacy_config("not json");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_legacy_config_ttl_exactly_30() {
+        let json = r#"{
+            "cloudflare": [{
+                "authentication": { "api_token": "tok" },
+                "zone_id": "z",
+                "subdomains": ["@"]
+            }],
+            "ttl": 30
+        }"#;
+        let config = parse_legacy_config(json).unwrap();
+        assert_eq!(config.ttl, 30);
+    }
+
+    #[test]
+    fn test_parse_legacy_config_purge_unknown() {
+        let json = r#"{
+            "cloudflare": [{
+                "authentication": { "api_token": "tok" },
+                "zone_id": "z",
+                "subdomains": ["@"],
+                "proxied": true
+            }],
+            "purgeUnknownRecords": true,
+            "a": true,
+            "aaaa": false
+        }"#;
+        let config = parse_legacy_config(json).unwrap();
+        assert!(config.purge_unknown_records);
+        assert!(config.a);
+        assert!(!config.aaaa);
+        assert!(config.cloudflare[0].proxied);
+    }
+
+    // --- substitute_env_vars ---
+
+    #[test]
+    fn test_substitute_no_match() {
+        let result = substitute_env_vars("no variables here");
+        assert_eq!(result, "no variables here");
+    }
+
+    #[test]
+    fn test_substitute_non_cf_ddns_vars_ignored() {
+        std::env::set_var("HOME", "/home/user");
+        let result = substitute_env_vars("home: $HOME");
+        assert_eq!(result, "home: $HOME"); // HOME doesn't start with CF_DDNS_
+    }
+
+    // --- print_config_summary ---
+
+    #[test]
+    fn test_print_config_summary_legacy_noop() {
+        let config = AppConfig {
+            auth: Auth::Token(String::new()),
+            providers: HashMap::new(),
+            domains: HashMap::new(),
+            extra_groups: Vec::new(),
+            waf_lists: Vec::new(),
+            update_cron: CronSchedule::Once,
+            update_on_start: true,
+            delete_on_stop: false,
+            delete_on_failure: true,
+            ttl: TTL::AUTO,
+            proxied_expression: None,
+            record_comment: None,
+            managed_comment_regex: None,
+            waf_list_description: None,
+            waf_list_item_comment: None,
+            managed_waf_comment_regex: None,
+            detection_timeout: Duration::from_secs(5),
+            update_timeout: Duration::from_secs(30),
+            reject_cloudflare_ips: false,
+            dry_run: false,
+            emoji: false,
+            quiet: false,
+            legacy_mode: true,
+            legacy_config: None,
+            repeat: false,
+        };
+        let pp = PP::new(false, false);
+        // Should return early without panicking for legacy mode
+        print_config_summary(&config, &pp);
+    }
+
+    #[test]
+    fn test_print_config_summary_env_mode() {
+        let mut domains = HashMap::new();
+        domains.insert(IpType::V4, vec!["example.com".to_string()]);
+        let config = AppConfig {
+            auth: Auth::Token("tok".to_string()),
+            providers: HashMap::new(),
+            domains,
+            extra_groups: Vec::new(),
+            waf_lists: Vec::new(),
+            update_cron: CronSchedule::Every(Duration::from_secs(300)),
+            update_on_start: true,
+            delete_on_stop: true,
+            delete_on_failure: true,
+            ttl: TTL::new(60),
+            proxied_expression: None,
+            record_comment: Some("managed".to_string()),
+            managed_comment_regex: None,
+            waf_list_description: None,
+            waf_list_item_comment: None,
+            managed_waf_comment_regex: None,
+            detection_timeout: Duration::from_secs(5),
+            update_timeout: Duration::from_secs(30),
+            reject_cloudflare_ips: false,
+            dry_run: false,
+            emoji: false,
+            quiet: false,
+            legacy_mode: false,
+            legacy_config: None,
+            repeat: false,
+        };
+        let pp = PP::new(false, false);
+        // Should print without panicking
+        print_config_summary(&config, &pp);
+    }
+
+    // ============================================================
+    // EnvGuard helper for safe env-var tests
+    // ============================================================
+
+    // Mutex to serialize env-var-dependent tests (prevents parallel interference)
+    static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct EnvGuard {
+        keys: Vec<String>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &str, value: &str) -> Self {
+            let lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+            std::env::set_var(key, value);
+            Self {
+                keys: vec![key.to_string()],
+                _lock: lock,
+            }
+        }
+
+        fn add(&mut self, key: &str, value: &str) {
+            std::env::set_var(key, value);
+            self.keys.push(key.to_string());
+        }
+
+        /// Remove a key from the environment and record it so Drop cleans up properly.
+        fn remove(&mut self, key: &str) {
+            std::env::remove_var(key);
+            self.keys.push(key.to_string());
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for key in &self.keys {
+                std::env::remove_var(key);
+            }
+        }
+    }
+
+    // ============================================================
+    // read_auth_from_env
+    // ============================================================
+
+    #[test]
+    fn test_read_auth_cloudflare_api_token() {
+        let mut g = EnvGuard::set("CLOUDFLARE_API_TOKEN_RA1", "secret-token");
+        g.remove("CF_API_TOKEN_RA1");
+        // We test via the real env-var names the function uses.
+        // Use a unique suffix to avoid cross-test pollution; the function reads
+        // fixed names, so we must use the real names. Accept the race risk in
+        // exchange for genuine coverage by running tests single-threaded or with
+        // the real variable names in isolation.
+        drop(g);
+
+        // Re-run using the canonical names the function actually reads.
+        let mut g2 = EnvGuard::set("CLOUDFLARE_API_TOKEN", "real-token-abc");
+        g2.remove("CF_API_TOKEN");
+        g2.remove("CLOUDFLARE_API_TOKEN_FILE");
+        g2.remove("CF_API_TOKEN_FILE");
+        g2.remove("CF_ACCOUNT_ID");
+        let pp = PP::new(false, true);
+        let auth = read_auth_from_env(&pp);
+        drop(g2);
+        assert!(matches!(auth, Some(Auth::Token(ref t)) if t == "real-token-abc"));
+    }
+
+    #[test]
+    fn test_read_auth_placeholder_token_returns_none() {
+        let mut g = EnvGuard::set("CLOUDFLARE_API_TOKEN", "YOUR-CLOUDFLARE-API-TOKEN");
+        g.remove("CF_API_TOKEN");
+        g.remove("CLOUDFLARE_API_TOKEN_FILE");
+        g.remove("CF_API_TOKEN_FILE");
+        g.remove("CF_ACCOUNT_ID");
+        let pp = PP::new(false, true);
+        let auth = read_auth_from_env(&pp);
+        drop(g);
+        assert!(auth.is_none());
+    }
+
+    #[test]
+    fn test_read_auth_cf_api_token_deprecated_fallback() {
+        let mut g = EnvGuard::set("CF_API_TOKEN", "deprecated-token");
+        g.remove("CLOUDFLARE_API_TOKEN");
+        g.remove("CLOUDFLARE_API_TOKEN_FILE");
+        g.remove("CF_API_TOKEN_FILE");
+        g.remove("CF_ACCOUNT_ID");
+        let pp = PP::new(false, true);
+        let auth = read_auth_from_env(&pp);
+        drop(g);
+        assert!(matches!(auth, Some(Auth::Token(ref t)) if t == "deprecated-token"));
+    }
+
+    #[test]
+    fn test_read_auth_no_vars_returns_none() {
+        let mut g = EnvGuard::set("_PLACEHOLDER_RA", "x"); // just to create guard
+        g.remove("CLOUDFLARE_API_TOKEN");
+        g.remove("CF_API_TOKEN");
+        g.remove("CLOUDFLARE_API_TOKEN_FILE");
+        g.remove("CF_API_TOKEN_FILE");
+        g.remove("CF_ACCOUNT_ID");
+        let pp = PP::new(false, true);
+        let auth = read_auth_from_env(&pp);
+        drop(g);
+        assert!(auth.is_none());
+    }
+
+    #[test]
+    fn test_read_auth_token_file_valid() {
+        use std::io::Write;
+        let dir = std::env::temp_dir();
+        let path = dir.join("cf_ddns_test_token_file_valid.txt");
+        {
+            let mut f = std::fs::File::create(&path).expect("create temp file");
+            write!(f, "  file-token-xyz  ").unwrap();
+        }
+        let path_str = path.to_str().unwrap().to_string();
+
+        let mut g = EnvGuard::set("CLOUDFLARE_API_TOKEN_FILE", &path_str);
+        g.remove("CLOUDFLARE_API_TOKEN");
+        g.remove("CF_API_TOKEN");
+        g.remove("CF_API_TOKEN_FILE");
+        g.remove("CF_ACCOUNT_ID");
+        let pp = PP::new(false, true);
+        let auth = read_auth_from_env(&pp);
+        drop(g);
+        let _ = std::fs::remove_file(&path);
+        assert!(matches!(auth, Some(Auth::Token(ref t)) if t == "file-token-xyz"));
+    }
+
+    #[test]
+    fn test_read_auth_token_file_missing_returns_none() {
+        let mut g = EnvGuard::set("CLOUDFLARE_API_TOKEN_FILE", "/nonexistent/path/token.txt");
+        g.remove("CLOUDFLARE_API_TOKEN");
+        g.remove("CF_API_TOKEN");
+        g.remove("CF_API_TOKEN_FILE");
+        g.remove("CF_ACCOUNT_ID");
+        let pp = PP::new(false, true);
+        let auth = read_auth_from_env(&pp);
+        drop(g);
+        assert!(auth.is_none());
+    }
+
+    #[test]
+    fn test_read_auth_cf_account_id_deprecated_warning() {
+        // CF_ACCOUNT_ID should emit a deprecation warning but not affect auth result.
+        let mut g = EnvGuard::set("CLOUDFLARE_API_TOKEN", "tok-with-account-id");
+        g.add("CF_ACCOUNT_ID", "acc123");
+        g.remove("CF_API_TOKEN");
+        g.remove("CLOUDFLARE_API_TOKEN_FILE");
+        g.remove("CF_API_TOKEN_FILE");
+        let pp = PP::new(false, true);
+        let auth = read_auth_from_env(&pp);
+        drop(g);
+        // Auth should still succeed with the token; CF_ACCOUNT_ID is just ignored.
+        assert!(matches!(auth, Some(Auth::Token(ref t)) if t == "tok-with-account-id"));
+    }
+
+    #[test]
+    fn test_read_auth_cf_api_token_file_deprecated_fallback() {
+        use std::io::Write;
+        let dir = std::env::temp_dir();
+        let path = dir.join("cf_ddns_test_token_file_deprecated.txt");
+        {
+            let mut f = std::fs::File::create(&path).expect("create temp file");
+            write!(f, "old-file-token").unwrap();
+        }
+        let path_str = path.to_str().unwrap().to_string();
+
+        let mut g = EnvGuard::set("CF_API_TOKEN_FILE", &path_str);
+        g.remove("CLOUDFLARE_API_TOKEN");
+        g.remove("CF_API_TOKEN");
+        g.remove("CLOUDFLARE_API_TOKEN_FILE");
+        g.remove("CF_ACCOUNT_ID");
+        let pp = PP::new(false, true);
+        let auth = read_auth_from_env(&pp);
+        drop(g);
+        let _ = std::fs::remove_file(&path);
+        assert!(matches!(auth, Some(Auth::Token(ref t)) if t == "old-file-token"));
+    }
+
+    // ============================================================
+    // read_providers_from_env
+    // ============================================================
+
+    #[test]
+    fn test_read_providers_defaults() {
+        let mut g = EnvGuard::set("_PLACEHOLDER_RP", "x");
+        g.remove("IP4_PROVIDER");
+        g.remove("IP4_POLICY");
+        g.remove("IP6_PROVIDER");
+        g.remove("IP6_POLICY");
+        let pp = PP::new(false, true);
+        let providers = read_providers_from_env(&pp).unwrap();
+        drop(g);
+        // Both V4 and V6 default to CloudflareTrace.
+        assert!(providers.contains_key(&IpType::V4));
+        assert!(providers.contains_key(&IpType::V6));
+        assert!(matches!(
+            providers[&IpType::V4],
+            ProviderType::CloudflareTrace { url: None }
+        ));
+        assert!(matches!(
+            providers[&IpType::V6],
+            ProviderType::CloudflareTrace { url: None }
+        ));
+    }
+
+    #[test]
+    fn test_read_providers_ip4_none_excludes_v4() {
+        let mut g = EnvGuard::set("IP4_PROVIDER", "none");
+        g.remove("IP4_POLICY");
+        g.remove("IP6_PROVIDER");
+        g.remove("IP6_POLICY");
+        let pp = PP::new(false, true);
+        let providers = read_providers_from_env(&pp).unwrap();
+        drop(g);
+        assert!(!providers.contains_key(&IpType::V4));
+        assert!(providers.contains_key(&IpType::V6));
+    }
+
+    #[test]
+    fn test_read_providers_ip6_none_excludes_v6() {
+        let mut g = EnvGuard::set("IP6_PROVIDER", "none");
+        g.remove("IP4_PROVIDER");
+        g.remove("IP4_POLICY");
+        g.remove("IP6_POLICY");
+        let pp = PP::new(false, true);
+        let providers = read_providers_from_env(&pp).unwrap();
+        drop(g);
+        assert!(providers.contains_key(&IpType::V4));
+        assert!(!providers.contains_key(&IpType::V6));
+    }
+
+    #[test]
+    fn test_read_providers_invalid_returns_error() {
+        let mut g = EnvGuard::set("IP4_PROVIDER", "totally_invalid_provider");
+        g.remove("IP4_POLICY");
+        g.remove("IP6_PROVIDER");
+        g.remove("IP6_POLICY");
+        let pp = PP::new(false, true);
+        let result = read_providers_from_env(&pp);
+        drop(g);
+        assert!(result.is_err());
+        assert!(result.err().unwrap().contains("IP4_PROVIDER"));
+    }
+
+    #[test]
+    fn test_read_providers_ip4_policy_deprecated() {
+        // IP4_POLICY is deprecated alias for IP4_PROVIDER.
+        let mut g = EnvGuard::set("IP4_POLICY", "ipify");
+        g.remove("IP4_PROVIDER");
+        g.remove("IP6_PROVIDER");
+        g.remove("IP6_POLICY");
+        let pp = PP::new(false, true);
+        let providers = read_providers_from_env(&pp).unwrap();
+        drop(g);
+        assert!(matches!(providers[&IpType::V4], ProviderType::Ipify));
+    }
+
+    #[test]
+    fn test_read_providers_ip6_policy_deprecated() {
+        // IP6_POLICY is deprecated alias for IP6_PROVIDER.
+        let mut g = EnvGuard::set("IP6_POLICY", "ipify");
+        g.remove("IP6_PROVIDER");
+        g.remove("IP4_PROVIDER");
+        g.remove("IP4_POLICY");
+        let pp = PP::new(false, true);
+        let providers = read_providers_from_env(&pp).unwrap();
+        drop(g);
+        assert!(matches!(providers[&IpType::V6], ProviderType::Ipify));
+    }
+
+    // ============================================================
+    // read_cron_from_env: @nevermore deprecated alias
+    // ============================================================
+
+    #[test]
+    fn test_read_cron_deprecated_nevermore() {
+        let g = EnvGuard::set("UPDATE_CRON", "@nevermore");
+        let pp = PP::new(false, true);
+        let sched = read_cron_from_env(&pp).unwrap();
+        drop(g);
+        assert!(matches!(sched, CronSchedule::Once));
+    }
+
+    #[test]
+    fn test_read_cron_invalid_duration_in_every() {
+        let g = EnvGuard::set("UPDATE_CRON", "@every notaduration");
+        let pp = PP::new(false, true);
+        let result = read_cron_from_env(&pp);
+        drop(g);
+        assert!(result.is_err());
+    }
+
+    // ============================================================
+    // load_env_config
+    // ============================================================
+
+    #[test]
+    fn test_load_env_config_basic_success() {
+        let mut g = EnvGuard::set("CLOUDFLARE_API_TOKEN", "tok-load-test");
+        g.add("DOMAINS", "example.com");
+        // Clear potentially interfering vars.
+        g.remove("CF_API_TOKEN");
+        g.remove("CLOUDFLARE_API_TOKEN_FILE");
+        g.remove("CF_API_TOKEN_FILE");
+        g.remove("CF_ACCOUNT_ID");
+        g.remove("IP4_DOMAINS");
+        g.remove("IP6_DOMAINS");
+        g.remove("WAF_LISTS");
+        g.remove("UPDATE_CRON");
+        g.remove("UPDATE_ON_START");
+        g.remove("DELETE_ON_STOP");
+        g.remove("TTL");
+        g.remove("PROXIED");
+        g.remove("IP4_PROVIDER");
+        g.remove("IP4_POLICY");
+        g.remove("IP6_PROVIDER");
+        g.remove("IP6_POLICY");
+        g.remove("PUID");
+        g.remove("PGID");
+        let pp = PP::new(false, true);
+        let config = load_env_config(&pp).unwrap();
+        drop(g);
+        assert!(matches!(config.auth, Auth::Token(ref t) if t == "tok-load-test"));
+        assert!(!config.domains.is_empty());
+        assert!(!config.legacy_mode);
+    }
+
+    #[test]
+    fn test_load_env_config_missing_auth_returns_error() {
+        let mut g = EnvGuard::set("DOMAINS", "example.com");
+        g.remove("CLOUDFLARE_API_TOKEN");
+        g.remove("CF_API_TOKEN");
+        g.remove("CLOUDFLARE_API_TOKEN_FILE");
+        g.remove("CF_API_TOKEN_FILE");
+        g.remove("CF_ACCOUNT_ID");
+        g.remove("WAF_LISTS");
+        g.remove("IP4_PROVIDER");
+        g.remove("IP4_POLICY");
+        g.remove("IP6_PROVIDER");
+        g.remove("IP6_POLICY");
+        g.remove("UPDATE_CRON");
+        g.remove("PUID");
+        g.remove("PGID");
+        let pp = PP::new(false, true);
+        let result = load_env_config(&pp);
+        drop(g);
+        assert!(result.is_err());
+        let err = result.err().unwrap();
+        assert!(err.contains("No authentication") || err.contains("CLOUDFLARE_API_TOKEN"));
+    }
+
+    #[test]
+    fn test_load_env_config_missing_domains_returns_error() {
+        let mut g = EnvGuard::set("CLOUDFLARE_API_TOKEN", "tok-no-domains");
+        g.remove("CF_API_TOKEN");
+        g.remove("CLOUDFLARE_API_TOKEN_FILE");
+        g.remove("CF_API_TOKEN_FILE");
+        g.remove("CF_ACCOUNT_ID");
+        g.remove("DOMAINS");
+        g.remove("IP4_DOMAINS");
+        g.remove("IP6_DOMAINS");
+        g.remove("WAF_LISTS");
+        g.remove("IP4_PROVIDER");
+        g.remove("IP4_POLICY");
+        g.remove("IP6_PROVIDER");
+        g.remove("IP6_POLICY");
+        g.remove("UPDATE_CRON");
+        g.remove("PUID");
+        g.remove("PGID");
+        let pp = PP::new(false, true);
+        let result = load_env_config(&pp);
+        drop(g);
+        assert!(result.is_err());
+        let err = result.err().unwrap();
+        assert!(err.contains("No update targets") || err.contains("DOMAINS"));
+    }
+
+    #[test]
+    fn test_load_env_config_once_update_on_start_false_errors() {
+        let mut g = EnvGuard::set("CLOUDFLARE_API_TOKEN", "tok-once-test");
+        g.add("DOMAINS", "example.com");
+        g.add("UPDATE_CRON", "@once");
+        g.add("UPDATE_ON_START", "false");
+        g.add("DELETE_ON_STOP", "false");
+        g.remove("CF_API_TOKEN");
+        g.remove("CLOUDFLARE_API_TOKEN_FILE");
+        g.remove("CF_API_TOKEN_FILE");
+        g.remove("CF_ACCOUNT_ID");
+        g.remove("IP4_DOMAINS");
+        g.remove("IP6_DOMAINS");
+        g.remove("WAF_LISTS");
+        g.remove("IP4_PROVIDER");
+        g.remove("IP4_POLICY");
+        g.remove("IP6_PROVIDER");
+        g.remove("IP6_POLICY");
+        g.remove("PUID");
+        g.remove("PGID");
+        let pp = PP::new(false, true);
+        let result = load_env_config(&pp);
+        drop(g);
+        assert!(result.is_err());
+        let err = result.err().unwrap();
+        assert!(err.contains("UPDATE_ON_START"));
+    }
+
+    #[test]
+    fn test_load_env_config_once_delete_on_stop_true_errors() {
+        let mut g = EnvGuard::set("CLOUDFLARE_API_TOKEN", "tok-once-del");
+        g.add("DOMAINS", "example.com");
+        g.add("UPDATE_CRON", "@once");
+        g.add("UPDATE_ON_START", "true");
+        g.add("DELETE_ON_STOP", "true");
+        g.remove("CF_API_TOKEN");
+        g.remove("CLOUDFLARE_API_TOKEN_FILE");
+        g.remove("CF_API_TOKEN_FILE");
+        g.remove("CF_ACCOUNT_ID");
+        g.remove("IP4_DOMAINS");
+        g.remove("IP6_DOMAINS");
+        g.remove("WAF_LISTS");
+        g.remove("IP4_PROVIDER");
+        g.remove("IP4_POLICY");
+        g.remove("IP6_PROVIDER");
+        g.remove("IP6_POLICY");
+        g.remove("PUID");
+        g.remove("PGID");
+        let pp = PP::new(false, true);
+        let result = load_env_config(&pp);
+        drop(g);
+        assert!(result.is_err());
+        let err = result.err().unwrap();
+        assert!(err.contains("DELETE_ON_STOP"));
+    }
+
+    #[test]
+    fn test_load_env_config_with_waf_list_only() {
+        // WAF_LISTS alone (no DOMAINS) should succeed.
+        let mut g = EnvGuard::set("CLOUDFLARE_API_TOKEN", "tok-waf-only");
+        g.add("WAF_LISTS", "acc123/my_list");
+        g.remove("CF_API_TOKEN");
+        g.remove("CLOUDFLARE_API_TOKEN_FILE");
+        g.remove("CF_API_TOKEN_FILE");
+        g.remove("CF_ACCOUNT_ID");
+        g.remove("DOMAINS");
+        g.remove("IP4_DOMAINS");
+        g.remove("IP6_DOMAINS");
+        g.remove("IP4_PROVIDER");
+        g.remove("IP4_POLICY");
+        g.remove("IP6_PROVIDER");
+        g.remove("IP6_POLICY");
+        g.remove("UPDATE_CRON");
+        g.remove("UPDATE_ON_START");
+        g.remove("DELETE_ON_STOP");
+        g.remove("PUID");
+        g.remove("PGID");
+        let pp = PP::new(false, true);
+        let result = load_env_config(&pp);
+        drop(g);
+        assert!(result.is_ok());
+        let config = result.unwrap();
+        assert_eq!(config.waf_lists.len(), 1);
+        assert!(config.domains.is_empty());
+    }
+
+    #[test]
+    fn test_load_env_config_puid_pgid_deprecated_still_succeeds() {
+        let mut g = EnvGuard::set("CLOUDFLARE_API_TOKEN", "tok-puid");
+        g.add("DOMAINS", "example.com");
+        g.add("PUID", "1000");
+        g.add("PGID", "1000");
+        g.remove("CF_API_TOKEN");
+        g.remove("CLOUDFLARE_API_TOKEN_FILE");
+        g.remove("CF_API_TOKEN_FILE");
+        g.remove("CF_ACCOUNT_ID");
+        g.remove("IP4_DOMAINS");
+        g.remove("IP6_DOMAINS");
+        g.remove("WAF_LISTS");
+        g.remove("IP4_PROVIDER");
+        g.remove("IP4_POLICY");
+        g.remove("IP6_PROVIDER");
+        g.remove("IP6_POLICY");
+        g.remove("UPDATE_CRON");
+        g.remove("UPDATE_ON_START");
+        g.remove("DELETE_ON_STOP");
+        let pp = PP::new(false, true);
+        let result = load_env_config(&pp);
+        drop(g);
+        // PUID/PGID are deprecated and ignored; config should still load.
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_load_env_config_invalid_provider_returns_error() {
+        let mut g = EnvGuard::set("CLOUDFLARE_API_TOKEN", "tok-bad-provider");
+        g.add("DOMAINS", "example.com");
+        g.add("IP4_PROVIDER", "not_a_real_provider");
+        g.remove("CF_API_TOKEN");
+        g.remove("CLOUDFLARE_API_TOKEN_FILE");
+        g.remove("CF_API_TOKEN_FILE");
+        g.remove("CF_ACCOUNT_ID");
+        g.remove("IP4_DOMAINS");
+        g.remove("IP6_DOMAINS");
+        g.remove("WAF_LISTS");
+        g.remove("IP4_POLICY");
+        g.remove("IP6_PROVIDER");
+        g.remove("IP6_POLICY");
+        g.remove("UPDATE_CRON");
+        g.remove("UPDATE_ON_START");
+        g.remove("DELETE_ON_STOP");
+        g.remove("PUID");
+        g.remove("PGID");
+        let pp = PP::new(false, true);
+        let result = load_env_config(&pp);
+        drop(g);
+        assert!(result.is_err());
+        assert!(result.err().unwrap().contains("IP4_PROVIDER"));
+    }
+
+    #[test]
+    fn test_load_env_config_comment_regex_mismatch_still_succeeds() {
+        // A mismatch between RECORD_COMMENT and MANAGED_RECORDS_COMMENT_REGEX should
+        // emit a warning but not fail.
+        let mut g = EnvGuard::set("CLOUDFLARE_API_TOKEN", "tok-regex-warn");
+        g.add("DOMAINS", "example.com");
+        g.add("RECORD_COMMENT", "my comment");
+        g.add("MANAGED_RECORDS_COMMENT_REGEX", "^cloudflare-ddns");
+        g.remove("CF_API_TOKEN");
+        g.remove("CLOUDFLARE_API_TOKEN_FILE");
+        g.remove("CF_API_TOKEN_FILE");
+        g.remove("CF_ACCOUNT_ID");
+        g.remove("IP4_DOMAINS");
+        g.remove("IP6_DOMAINS");
+        g.remove("WAF_LISTS");
+        g.remove("IP4_PROVIDER");
+        g.remove("IP4_POLICY");
+        g.remove("IP6_PROVIDER");
+        g.remove("IP6_POLICY");
+        g.remove("UPDATE_CRON");
+        g.remove("UPDATE_ON_START");
+        g.remove("DELETE_ON_STOP");
+        g.remove("PUID");
+        g.remove("PGID");
+        let pp = PP::new(false, true);
+        let result = load_env_config(&pp);
+        drop(g);
+        assert!(result.is_ok());
+    }
+
+    // ============================================================
+    // setup_notifiers
+    // ============================================================
+
+    #[test]
+    fn test_setup_notifiers_no_shoutrrr_returns_empty() {
+        let mut g = EnvGuard::set("_PLACEHOLDER_SN", "x");
+        g.remove("SHOUTRRR");
+        let pp = PP::new(false, true);
+        let _notifier = setup_notifiers(&pp);
+        drop(g);
+    }
+
+    #[test]
+    fn test_setup_notifiers_empty_shoutrrr_returns_empty() {
+        let g = EnvGuard::set("SHOUTRRR", "");
+        let pp = PP::new(false, true);
+        let _notifier = setup_notifiers(&pp);
+        drop(g);
+    }
+
+    // ============================================================
+    // setup_heartbeats
+    // ============================================================
+
+    #[test]
+    fn test_setup_heartbeats_no_vars_returns_empty() {
+        let mut g = EnvGuard::set("_PLACEHOLDER_HB", "x");
+        g.remove("HEALTHCHECKS");
+        g.remove("UPTIMEKUMA");
+        let pp = PP::new(false, true);
+        let _hb = setup_heartbeats(&pp);
+        drop(g);
+    }
+
+    #[test]
+    fn test_setup_heartbeats_healthchecks_only() {
+        let mut g = EnvGuard::set("HEALTHCHECKS", "https://hc-ping.com/abc123");
+        g.remove("UPTIMEKUMA");
+        let pp = PP::new(false, true);
+        let _hb = setup_heartbeats(&pp);
+        drop(g);
+    }
+
+    #[test]
+    fn test_setup_heartbeats_uptimekuma_only() {
+        let mut g = EnvGuard::set("UPTIMEKUMA", "https://status.example.com/api/push/abc");
+        g.remove("HEALTHCHECKS");
+        let pp = PP::new(false, true);
+        let _hb = setup_heartbeats(&pp);
+        drop(g);
+    }
+
+    #[test]
+    fn test_setup_heartbeats_both_monitors() {
+        let mut g = EnvGuard::set("HEALTHCHECKS", "https://hc-ping.com/abc");
+        g.add("UPTIMEKUMA", "https://status.example.com/api/push/def");
+        let pp = PP::new(false, true);
+        let _hb = setup_heartbeats(&pp);
+        drop(g);
+    }
+
+    // ============================================================
+    // print_config_summary - additional coverage paths
+    // ============================================================
+
+    #[test]
+    fn test_print_config_summary_with_waf_lists() {
+        use crate::cloudflare::WAFList;
+        let waf_list = WAFList {
+            account_id: "acc123".to_string(),
+            list_name: "my_list".to_string(),
+        };
+        let config = AppConfig {
+            auth: Auth::Token("tok".to_string()),
+            providers: HashMap::new(),
+            domains: HashMap::new(),
+            extra_groups: Vec::new(),
+            waf_lists: vec![waf_list],
+            update_cron: CronSchedule::Every(Duration::from_secs(300)),
+            update_on_start: true,
+            delete_on_stop: false,
+            delete_on_failure: true,
+            ttl: TTL::AUTO,
+            proxied_expression: None,
+            record_comment: None,
+            managed_comment_regex: None,
+            waf_list_description: None,
+            waf_list_item_comment: None,
+            managed_waf_comment_regex: None,
+            detection_timeout: Duration::from_secs(5),
+            update_timeout: Duration::from_secs(30),
+            reject_cloudflare_ips: false,
+            dry_run: false,
+            emoji: false,
+            quiet: false,
+            legacy_mode: false,
+            legacy_config: None,
+            repeat: false,
+        };
+        let pp = PP::new(false, true);
+        print_config_summary(&config, &pp); // must not panic
+    }
+
+    #[test]
+    fn test_print_config_summary_with_providers_and_delete_on_stop() {
+        let mut providers = HashMap::new();
+        providers.insert(IpType::V4, ProviderType::CloudflareTrace { url: None });
+        providers.insert(IpType::V6, ProviderType::Ipify);
+        let mut domains = HashMap::new();
+        domains.insert(IpType::V4, vec!["v4.example.com".to_string()]);
+        let config = AppConfig {
+            auth: Auth::Token("tok".to_string()),
+            providers,
+            domains,
+            extra_groups: Vec::new(),
+            waf_lists: Vec::new(),
+            update_cron: CronSchedule::Every(Duration::from_secs(600)),
+            update_on_start: true,
+            delete_on_stop: true,
+            delete_on_failure: true,
+            ttl: TTL::new(120),
+            proxied_expression: None,
+            record_comment: Some("cf-ddns".to_string()),
+            managed_comment_regex: None,
+            waf_list_description: None,
+            waf_list_item_comment: None,
+            managed_waf_comment_regex: None,
+            detection_timeout: Duration::from_secs(5),
+            update_timeout: Duration::from_secs(30),
+            reject_cloudflare_ips: false,
+            dry_run: false,
+            emoji: false,
+            quiet: true,
+            legacy_mode: false,
+            legacy_config: None,
+            repeat: true,
+        };
+        let pp = PP::new(false, true);
+        print_config_summary(&config, &pp); // must not panic
+    }
+
+    #[test]
+    fn test_print_config_summary_once_schedule() {
+        let mut domains = HashMap::new();
+        domains.insert(IpType::V6, vec!["ipv6.example.com".to_string()]);
+        let config = AppConfig {
+            auth: Auth::Token("tok".to_string()),
+            providers: HashMap::new(),
+            domains,
+            extra_groups: Vec::new(),
+            waf_lists: Vec::new(),
+            update_cron: CronSchedule::Once,
+            update_on_start: true,
+            delete_on_stop: false,
+            delete_on_failure: true,
+            ttl: TTL::AUTO,
+            proxied_expression: None,
+            record_comment: None,
+            managed_comment_regex: None,
+            waf_list_description: None,
+            waf_list_item_comment: None,
+            managed_waf_comment_regex: None,
+            detection_timeout: Duration::from_secs(5),
+            update_timeout: Duration::from_secs(30),
+            reject_cloudflare_ips: false,
+            dry_run: false,
+            emoji: false,
+            quiet: false,
+            legacy_mode: false,
+            legacy_config: None,
+            repeat: false,
+        };
+        let pp = PP::new(false, true);
+        print_config_summary(&config, &pp); // must not panic
+    }
+
+    // ============================================================
+    // Fail-closed validation and token normalization
+    // ============================================================
+
+    /// Minimal valid env config with every optional knob cleared.
+    fn base_env_guard() -> EnvGuard {
+        let mut g = EnvGuard::set("CLOUDFLARE_API_TOKEN", "tok-validate");
+        g.add("DOMAINS", "example.com");
+        for k in [
+            "CF_API_TOKEN", "CLOUDFLARE_API_TOKEN_FILE", "CF_API_TOKEN_FILE", "CF_ACCOUNT_ID",
+            "IP4_DOMAINS", "IP6_DOMAINS", "WAF_LISTS", "UPDATE_CRON", "UPDATE_ON_START",
+            "DELETE_ON_STOP", "TTL", "PROXIED", "IP4_PROVIDER", "IP4_POLICY", "IP6_PROVIDER",
+            "IP6_POLICY", "PUID", "PGID", "MANAGED_RECORDS_COMMENT_REGEX",
+            "MANAGED_WAF_LIST_ITEMS_COMMENT_REGEX", "DETECTION_TIMEOUT", "UPDATE_TIMEOUT",
+        ] {
+            g.remove(k);
+        }
+        g
+    }
+
+    #[test]
+    fn test_load_env_config_rejects_invalid_values() {
+        let cases = [
+            ("PROXIED", "sub(example.com", "PROXIED"),
+            ("MANAGED_RECORDS_COMMENT_REGEX", "^ddns-(", "MANAGED_RECORDS_COMMENT_REGEX"),
+            ("MANAGED_WAF_LIST_ITEMS_COMMENT_REGEX", "[", "MANAGED_WAF_LIST_ITEMS_COMMENT_REGEX"),
+            ("WAF_LISTS", "missing-slash", "WAF_LISTS"),
+            ("TTL", "abc", "TTL"),
+            ("DETECTION_TIMEOUT", "500ms", "DETECTION_TIMEOUT"),
+            ("UPDATE_TIMEOUT", "0", "UPDATE_TIMEOUT"),
+        ];
+        for (key, value, expected) in cases {
+            let mut g = base_env_guard();
+            g.add(key, value);
+            let err = load_env_config(&PP::new(false, true)).err();
+            drop(g);
+            let err = err.unwrap_or_else(|| panic!("{key}={value} should be rejected"));
+            assert!(err.contains(expected), "{key}: {err}");
+        }
+    }
+
+    #[test]
+    fn test_update_cron_below_minimum_is_clamped() {
+        let mut g = base_env_guard();
+        g.add("UPDATE_CRON", "@every 0s");
+        let config = load_env_config(&PP::new(false, true)).unwrap_or_else(|e| panic!("{e}"));
+        drop(g);
+        assert!(matches!(config.update_cron, CronSchedule::Every(d) if d == MIN_UPDATE_INTERVAL));
+    }
+
+    #[test]
+    fn test_normalize_token_strips_quotes() {
+        let pp = PP::new(false, true);
+        assert_eq!(normalize_token("\"abc-123_x\"", "T", &pp).unwrap(), "abc-123_x");
+        assert_eq!(normalize_token("'abc'", "T", &pp).unwrap(), "abc");
+        assert_eq!(normalize_token("  abc\n", "T", &pp).unwrap(), "abc");
+    }
+
+    #[test]
+    fn test_normalize_token_rejects_bad_chars_without_leaking() {
+        let pp = PP::new(false, true);
+        for bad in ["abc def", "abc\ndef", "${CF_DDNS_TOKEN}", "Bearer abc", "\"\"", "tök"] {
+            let err = normalize_token(bad, "CLOUDFLARE_API_TOKEN", &pp).unwrap_err();
+            assert!(err.contains("CLOUDFLARE_API_TOKEN"), "{bad}: {err}");
+            if bad.len() > 3 {
+                assert!(!err.contains(bad), "error must not echo the token: {err}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_read_auth_quoted_token_is_normalized() {
+        let mut g = base_env_guard();
+        g.add("CLOUDFLARE_API_TOKEN", "\"quoted-token\"");
+        let auth = read_auth_from_env(&PP::new(false, true));
+        drop(g);
+        assert!(matches!(auth, Some(Auth::Token(ref t)) if t == "quoted-token"));
+    }
+
+    fn legacy_with(api_token: &str, ttl: i64) -> LegacyConfig {
+        LegacyConfig {
+            cloudflare: vec![LegacyCloudflareEntry {
+                authentication: LegacyAuthentication {
+                    api_token: api_token.to_string(),
+                    api_key: None,
+                },
+                zone_id: "zone1".to_string(),
+                subdomains: vec![LegacySubdomainEntry::Simple("@".to_string())],
+                proxied: false,
+            }],
+            a: true,
+            aaaa: false,
+            purge_unknown_records: false,
+            ttl,
+            ip4_provider: None,
+            ip6_provider: None,
+            record_comment: None,
+        }
+    }
+
+    #[test]
+    fn test_legacy_missing_credentials_is_error() {
+        for token in ["", "api_token_here"] {
+            let err = legacy_to_app_config(legacy_with(token, 300), false, false)
+                .err()
+                .expect("missing credentials must be rejected");
+            assert!(err.contains("cloudflare[0]"), "{err}");
+        }
+    }
+
+    #[test]
+    fn test_legacy_token_is_normalized() {
+        let config = legacy_with(" 'tok-legacy' ", 300);
+        let config = legacy_to_app_config(config, false, false).unwrap();
+        assert!(matches!(config.auth, Auth::Token(ref t) if t == "tok-legacy"));
+        let legacy = config.legacy_config.unwrap();
+        assert_eq!(legacy.cloudflare[0].authentication.api_token, "tok-legacy");
+    }
+
+    #[test]
+    fn test_legacy_auto_ttl_does_not_poll_every_second() {
+        let config = legacy_to_app_config(legacy_with("tok", 1), false, true).unwrap();
+        assert!(
+            matches!(config.update_cron, CronSchedule::Every(d) if d == LEGACY_AUTO_TTL_INTERVAL)
+        );
+        let config = legacy_to_app_config(legacy_with("tok", 600), false, true).unwrap();
+        assert!(matches!(config.update_cron, CronSchedule::Every(d) if d == Duration::from_secs(600)));
+    }
+
+    #[test]
+    fn test_substitute_env_vars_prefers_longest_name() {
+        let mut g = EnvGuard::set("CF_DDNS_SUBST", "short");
+        g.add("CF_DDNS_SUBST_2", "long");
+        let out = substitute_env_vars("$CF_DDNS_SUBST_2 ${CF_DDNS_SUBST}");
+        drop(g);
+        assert_eq!(out, "long short");
+    }
+
+    // ============================================================
+    // Detection groups (issue #248)
+    // ============================================================
+
+    fn group_guard() -> EnvGuard {
+        let mut g = base_env_guard();
+        for k in [
+            "DOMAINS_2", "IP4_DOMAINS_2", "IP6_DOMAINS_2", "IP4_PROVIDER_2", "IP6_PROVIDER_2",
+            "DOMAINS_3", "DOMAINS_1", "IP4_PROVIDER_3",
+        ] {
+            g.remove(k);
+        }
+        g
+    }
+
+    #[test]
+    fn test_no_groups_by_default() {
+        let g = group_guard();
+        let config = load_env_config(&PP::new(false, true)).unwrap_or_else(|e| panic!("{e}"));
+        drop(g);
+        assert!(config.extra_groups.is_empty());
+        assert_eq!(config.groups().len(), 1);
+    }
+
+    #[test]
+    fn test_group_parsing_and_inheritance() {
+        let mut g = group_guard();
+        g.add("IP6_PROVIDER", "local.iface:eth0");
+        g.add("DOMAINS_2", "b.example.com");
+        g.add("IP4_PROVIDER_2", "cloudflare.trace@ens5");
+        g.add("IP4_DOMAINS_3", "c.example.com");
+        g.add("IP4_PROVIDER_3", "none");
+        let config = load_env_config(&PP::new(false, true)).unwrap_or_else(|e| panic!("{e}"));
+        drop(g);
+
+        assert_eq!(config.extra_groups.len(), 2);
+        let g2 = &config.extra_groups[0];
+        assert_eq!(g2.label, "2");
+        assert_eq!(g2.providers[&IpType::V4].label(), "cloudflare.trace@ens5");
+        // IPv6 inherited from the default group.
+        assert_eq!(g2.providers[&IpType::V6].label(), "local.iface");
+        assert_eq!(g2.domains[&IpType::V6], vec!["b.example.com".to_string()]);
+
+        let g3 = &config.extra_groups[1];
+        assert_eq!(g3.label, "3");
+        assert!(!g3.providers.contains_key(&IpType::V4), "none disables the family");
+    }
+
+    #[test]
+    fn test_group_one_is_rejected() {
+        let mut g = group_guard();
+        g.add("DOMAINS_1", "x.example.com");
+        let err = load_env_config(&PP::new(false, true)).err();
+        drop(g);
+        assert!(err.unwrap().contains("start at _2"));
+    }
+
+    #[test]
+    fn test_group_overlap_is_rejected() {
+        let mut g = group_guard();
+        g.add("DOMAINS_2", "Example.com");
+        let err = load_env_config(&PP::new(false, true)).err();
+        drop(g);
+        let err = err.expect("overlap must be rejected");
+        assert!(err.contains("both the default and group 2"), "{err}");
+    }
+
+    #[test]
+    fn test_group_without_domains_is_ignored() {
+        let mut g = group_guard();
+        g.add("IP4_PROVIDER_2", "ipify@eth1");
+        let config = load_env_config(&PP::new(false, true)).unwrap_or_else(|e| panic!("{e}"));
+        drop(g);
+        assert!(config.extra_groups.is_empty());
+    }
+
+    #[test]
+    fn test_invalid_group_provider_is_error() {
+        let mut g = group_guard();
+        g.add("DOMAINS_2", "b.example.com");
+        g.add("IP4_PROVIDER_2", "local@eth0");
+        let err = load_env_config(&PP::new(false, true)).err();
+        drop(g);
+        assert!(err.unwrap().contains("IP4_PROVIDER_2"));
+    }
+
+    #[test]
+    fn test_group_domains_alone_enable_env_mode() {
+        let mut g = group_guard();
+        g.remove("CLOUDFLARE_API_TOKEN");
+        g.remove("DOMAINS");
+        g.add("DOMAINS_2", "b.example.com");
+        let env_mode = is_env_config_mode();
+        drop(g);
+        assert!(env_mode);
+    }
+}

@@ -1,0 +1,120 @@
+image:
+  repository: timothyjmiller/cloudflare-ddns
+  pullPolicy: IfNotPresent
+  # Overrides the image tag — defaults to chart appVersion
+  tag: ""
+
+# Must stay at 1. Multiple replicas cause duplicate DNS updates.
+replicaCount: 1
+
+# Host networking is needed for IPv6 detection: cloudflare.trace (and the
+# other network providers) must egress over the node's IPv6 address, and the
+# local / local.iface: / local.iface.stable: providers read the node's
+# interfaces. Safe to disable if you only need IPv4 (ip6Provider: none).
+hostNetwork: true
+
+# --- Authentication & secrets ---
+# Supply apiToken directly (the chart creates a Secret) OR reference an
+# existing Secret with existingSecret.
+#
+# The Secret also carries SHOUTRRR, HEALTHCHECKS and UPTIMEKUMA (these URLs
+# embed credentials). When using existingSecret, put those keys in your own
+# Secret instead of setting shoutrrr/healthchecks/uptimeKuma below; missing
+# keys are simply ignored.
+cloudflare:
+  apiToken: ""
+  existingSecret: ""
+  # Key holding the API token inside existingSecret.
+  existingSecretKey: "CLOUDFLARE_API_TOKEN"
+
+# --- Update targets ---
+# Comma-separated. At least one of domains / ip4Domains / ip6Domains /
+# wafLists must be set.
+domains: ""
+ip4Domains: ""
+ip6Domains: ""
+
+# --- IP Detection ---
+# Options: cloudflare.trace, cloudflare.trace:<url>, cloudflare.doh, ipify,
+#          local, local.iface:<name>, local.iface.stable:<name>,
+#          url:<url>, literal:<ip1,ip2>, none
+ip4Provider: "cloudflare.trace"
+ip6Provider: "cloudflare.trace"
+# Reject detected IPs that fall inside Cloudflare's published ranges.
+rejectCloudflareIps: true
+
+# --- Scheduling ---
+updateCron: "@every 5m"
+updateOnStart: true
+deleteOnStop: false
+# Delete managed records when a deterministic provider (literal:, local,
+# local.iface:, local.iface.stable:) reports no address for that family.
+# Transient detection errors never delete records.
+deleteOnFailure: false
+
+# --- DNS Record Settings ---
+ttl: 1
+# Boolean expression: true, false, is(domain), sub(domain), and combos
+proxied: "false"
+recordComment: ""
+managedRecordsCommentRegex: ""
+
+# --- WAF Lists ---
+# Comma-separated, format: account-id/list-name
+# Requires Account > Account Filter Lists > Edit on the token.
+wafLists: ""
+wafListDescription: ""
+wafListItemComment: ""
+managedWafListItemsCommentRegex: ""
+
+# --- Notifications (Shoutrrr) — stored in the Secret ---
+# Newline-separated URLs: discord://, slack://, telegram://, gotify://,
+# pushover://, zulip://, generic://, generic+https://, https://...
+# Use a YAML block scalar for several services:
+#   shoutrrr: |
+#     discord://token@webhook-id
+#     telegram://bot-token@telegram?chats=chat-id
+shoutrrr: ""
+
+# --- Heartbeat Monitoring — stored in the Secret ---
+healthchecks: ""
+uptimeKuma: ""
+
+# --- Timeouts ---
+detectionTimeout: "5s"
+updateTimeout: "30s"
+
+# --- Output ---
+emoji: true
+quiet: false
+
+# --- Resources ---
+resources:
+  limits:
+    memory: 32Mi
+    cpu: 50m
+
+# --- Security context ---
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65534
+  runAsGroup: 65534
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+# Additional env vars for any setting not exposed above
+extraEnv: []
+# - name: UPDATE_CRON
+#   value: "@every 10m"
+
+podAnnotations: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}

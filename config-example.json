@@ -1,0 +1,27 @@
+{
+  "cloudflare": [
+    {
+      "authentication": {
+        "api_token": "api_token_here"
+      },
+      "zone_id": "your_zone_id_here",
+      "subdomains": [
+        {
+          "name": "",
+          "proxied": false
+        },
+        {
+          "name": "remove_or_replace_with_your_subdomain",
+          "proxied": false
+        }
+      ]
+    }
+  ],
+  "a": true,
+  "aaaa": true,
+  "purgeUnknownRecords": false,
+  "ttl": 300,
+  "ip4_provider": "cloudflare.trace",
+  "ip6_provider": "cloudflare.trace",
+  "recordComment": "managed by cloudflare-ddns"
+}

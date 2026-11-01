@@ -1,0 +1,13 @@
+# Private API keys for updating IPv4 & IPv6 addresses on Cloudflare
+config.json
+
+# Rust build artifacts
+/target/
+debug/
+*.pdb
+
+# Git History
+**/.history/*
+
+# JetBrains IDE
+.idea/
